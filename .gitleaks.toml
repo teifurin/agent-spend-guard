@@ -1,0 +1,25 @@
+# gitleaks configuration: the default ruleset plus PayPal-specific patterns.
+# Runs in the pre-commit hook (.githooks/pre-commit) and in CI (.github/workflows/ci.yml).
+title = "agent-spend-guard"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "paypal-rest-credential"
+description = "PayPal REST client id / secret (80 chars, starts with A or E)"
+regex = '''\b[AE][A-Za-z0-9_-]{79}\b'''
+entropy = 3.5
+
+[[rules]]
+id = "paypal-access-token"
+description = "PayPal OAuth access token"
+regex = '''\bA21AA[A-Za-z0-9_-]{40,}\b'''
+
+[allowlist]
+description = "Files that hold names or patterns, never values"
+paths = [
+  '''\.env\.example$''',
+  '''package-lock\.json$''',
+  '''\.gitleaks\.toml$''',
+]

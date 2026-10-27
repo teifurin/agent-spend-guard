@@ -1,0 +1,25 @@
+#!/bin/sh
+# Pre-commit guard for a repo that will become public.
+# 1) Never let secret-bearing files into the index, with or without gitleaks.
+# 2) Run gitleaks on the staged changes when it is installed; warn loudly when it is not.
+set -e
+
+blocked=$(git diff --cached --name-only --diff-filter=AMR \
+  | grep -E '(^|/)(\.env|\.env\.[^/]+|\.spike-state\.json|[^/]+\.db|[^/]+\.sqlite)$' \
+  | grep -vE '\.env\.example$' || true)
+if [ -n "$blocked" ]; then
+  echo "pre-commit: refusing to commit secret-bearing files:" >&2
+  echo "$blocked" | sed 's/^/  /' >&2
+  exit 1
+fi
+
+if command -v gitleaks >/dev/null 2>&1; then
+  if gitleaks git --help >/dev/null 2>&1; then
+    gitleaks git --pre-commit --staged --redact --no-banner --config .gitleaks.toml
+  else
+    gitleaks protect --staged --redact --no-banner --config .gitleaks.toml
+  fi
+else
+  echo "pre-commit WARNING: gitleaks is not installed, so staged changes were NOT scanned for secrets." >&2
+  echo "  Install it (Windows): winget install gitleaks     (other: https://github.com/gitleaks/gitleaks#installing)" >&2
+fi

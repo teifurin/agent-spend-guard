@@ -1,0 +1,16 @@
+# secrets and local state: never commit
+.env
+.env.*
+!.env.example
+.spike-state.json
+*.db
+*.db-journal
+*.sqlite
+
+node_modules/
+dist/
+coverage/
+*.log
+*.tsbuildinfo
+.DS_Store
+Thumbs.db

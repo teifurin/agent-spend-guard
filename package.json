@@ -1,0 +1,33 @@
+{
+  "name": "agent-spend-guard",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Policy and human-approval guardrail between AI agents and PayPal (sandbox only). PayPal AI Hackathon 2026 entry.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "prepare": "node scripts/setup-hooks.mjs",
+    "check-env": "tsx scripts/check-env.ts",
+    "spike:vault": "tsx scripts/spike-vault.ts --mode vault",
+    "spike:order": "tsx scripts/spike-vault.ts --mode order",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "node scripts/not-yet.mjs dev M1",
+    "demo:seed": "node scripts/not-yet.mjs demo:seed M2",
+    "e2e:sandbox": "node scripts/not-yet.mjs e2e:sandbox M1"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^22.20.5",
+    "eslint": "^10.13.0",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.72.1",
+    "vitest": "^5.0.5"
+  }
+}
