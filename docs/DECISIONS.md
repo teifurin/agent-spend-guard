@@ -65,7 +65,7 @@ The pre-commit hook (`.githooks/pre-commit`, enabled by `npm install` through th
 - `HOLD` (the request is outside the owner's rules; the owner decides on their phone): `OVER_TX_CAP`, `OVER_MONTHLY_BUDGET`, `MERCHANT_NOT_ALLOWED`, `CATEGORY_NOT_ALLOWED`, `OUTSIDE_TIME_WINDOW`, `NEW_MERCHANT`.
 - `BLOCK` (nothing to decide): `AGENT_DISABLED`, `NO_POLICY`, `INVALID_AMOUNT`, `CURRENCY_MISMATCH`, `OVER_HARD_TX_CAP` (an optional ceiling the owner never wants to be asked about).
 
-The verdict is the worst severity present. Caps and the budget are inclusive (equal is fine, one cent over is not). A misconfigured hours window fails closed (HOLD). Allowlist matching is case-, width- and whitespace-insensitive (NFKC). An allowlisted merchant counts as known; `NEW_MERCHANT` only fires when the policy has no merchant allowlist.
+The verdict is the worst severity present. Caps and the budget are inclusive (equal is fine, one cent over is not). The hours window is `[start, end)` in the policy zone, wraps past midnight when `start > end`, and `start == end` means the whole day. A misconfigured hours window fails closed (HOLD). Allowlist matching is case-, width- and whitespace-insensitive (NFKC). An allowlisted merchant counts as known; `NEW_MERCHANT` only fires when the policy has no merchant allowlist.
 
 **Composition with later steps.** Verdicts map onto the final decision vocabulary as `ALLOW -> AUTO_APPROVE`, `HOLD -> HOLD`, `BLOCK -> BLOCK`. The AI reviewer (M3) may only move a decision to the right (`AUTO_APPROVE -> HOLD -> BLOCK`), never to the left, and any reviewer failure or timeout means `HOLD`. Suspicion (prompt injection, reason/item mismatch, price anomaly) therefore comes from the reviewer; the engine blocks only on hard facts.
 
