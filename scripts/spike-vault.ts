@@ -451,5 +451,7 @@ main().catch((err: unknown) => {
     console.error(`[fail] ${err instanceof Error ? err.message : String(err)}`);
   }
   printSummary(currentMode, 'failure');
-  process.exit(1);
+  // Set the exit code instead of calling process.exit(): on Windows, exiting while undici's sockets are still
+  // closing trips a libuv assertion (UV_HANDLE_CLOSING) and turns the exit code into 127.
+  process.exitCode = 1;
 });

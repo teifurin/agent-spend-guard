@@ -25,4 +25,4 @@ for (const key of REQUIRED) {
 for (const key of OPTIONAL) console.log(`${key}=${isSet(key) ? 'set' : 'missing'}`);
 
 console.log(ready ? 'READY: required PayPal sandbox settings are present.' : 'NOT READY: copy .env.example to .env and fill in the missing values.');
-process.exit(ready ? 0 : 1);
+process.exitCode = ready ? 0 : 1;
