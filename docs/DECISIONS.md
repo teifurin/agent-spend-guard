@@ -38,11 +38,13 @@ Architecture decision log, oldest first. Each entry says what was decided, why, 
 
 **Why.** Judges must be able to run everything for free, and mock mode makes tests deterministic. The AI reviewer may only tighten a decision (allow to hold or block), never loosen it, and any LLM failure or timeout means HOLD, so the mock/real choice never changes safety.
 
-## D5. Runtime: Node 22.13 or newer; SQLite driver decided at M1 (2026-10-27)
+## D5. Runtime: Node 22.13 or newer; SQLite through the built-in `node:sqlite` (2026-10-27)
 
-**Decision.** `engines.node >= 22.13`. Node 20 reached end of life in April 2026 and current Vitest requires 22 or newer.
+**Decision.** `engines.node >= 22.13`. Node 20 reached end of life in April 2026 and current Vitest requires 22 or newer. The database is Node's built-in `node:sqlite` (`DatabaseSync`), not `better-sqlite3`.
 
-**Open.** `better-sqlite3` (prebuilt native binary, battle-tested) versus the built-in `node:sqlite` (no native dependency, unflagged since 22.13). Decide at M1 when the schema lands. Leaning `node:sqlite` so that `npm ci` stays free of native builds for judges, unless its API gaps bite.
+**Why.** No native module to build or prebuild: `npm ci` stays dependency-free for judges on any platform. The synchronous API covers everything the guard needs (prepared statements, transactions, WAL). Verified on Node 24.16 with SQLite 3.53, including a database file under a path with non-ASCII characters (tested).
+
+**Caveat.** Node 22.x prints an `ExperimentalWarning` for `node:sqlite`; it is harmless and goes away on Node 23.4+ and 24. Booleans are stored as 0/1 and timestamps as integer epoch milliseconds because the driver binds only null, numbers, bigints, strings and buffers.
 
 ## D6. No dotenv: Node's `process.loadEnvFile` (2026-10-27)
 
@@ -55,3 +57,24 @@ The pre-commit hook (`.githooks/pre-commit`, enabled by `npm install` through th
 ## D8. Idempotency: `PayPal-Request-Id` derived from our own ids (2026-10-27)
 
 `requestIdFor(scope, key)` yields `asg-<scope>-<first 32 hex chars of sha256(scope, key)>`. Creating an order, capturing it and refunding it for the same request each get a stable id, so a retried call cannot double-charge. `invoice_id` is also set per request (D3).
+
+## D9. Policy verdicts: HOLD means "ask the owner", BLOCK means "do not even ask" (2026-10-27)
+
+**Decision.** The deterministic engine (`src/policy/engine.ts`) returns `ALLOW`, `HOLD` or `BLOCK` plus every triggered reason code. Each code has a fixed severity (`src/policy/reasons.ts`):
+
+- `HOLD` (the request is outside the owner's rules; the owner decides on their phone): `OVER_TX_CAP`, `OVER_MONTHLY_BUDGET`, `MERCHANT_NOT_ALLOWED`, `CATEGORY_NOT_ALLOWED`, `OUTSIDE_TIME_WINDOW`, `NEW_MERCHANT`.
+- `BLOCK` (nothing to decide): `AGENT_DISABLED`, `NO_POLICY`, `INVALID_AMOUNT`, `CURRENCY_MISMATCH`, `OVER_HARD_TX_CAP` (an optional ceiling the owner never wants to be asked about).
+
+The verdict is the worst severity present. Caps and the budget are inclusive (equal is fine, one cent over is not). A misconfigured hours window fails closed (HOLD). Allowlist matching is case-, width- and whitespace-insensitive (NFKC). An allowlisted merchant counts as known; `NEW_MERCHANT` only fires when the policy has no merchant allowlist.
+
+**Composition with later steps.** Verdicts map onto the final decision vocabulary as `ALLOW -> AUTO_APPROVE`, `HOLD -> HOLD`, `BLOCK -> BLOCK`. The AI reviewer (M3) may only move a decision to the right (`AUTO_APPROVE -> HOLD -> BLOCK`), never to the left, and any reviewer failure or timeout means `HOLD`. Suspicion (prompt injection, reason/item mismatch, price anomaly) therefore comes from the reviewer; the engine blocks only on hard facts.
+
+**Why.** Judges and owners should be able to predict the engine. Putting the "ask a human" line at the rules and the "never" line at hard facts keeps the owner in control without making them approve nonsense.
+
+## D10. Budget accounting and the request lifecycle (2026-10-27)
+
+**Spend that counts** against an agent's monthly budget (`Repo.spentThisMonthMinor`): completed PayPal captures whose `captured_at` falls in the policy's calendar month (in the policy's IANA zone), plus requests in `AUTO_APPROVED` or `APPROVED` that are not yet captured (in flight, usually for seconds). `HELD` requests reserve nothing; an owner approving a held request may knowingly exceed the budget. Refunded captures no longer count, so a refund gives the budget back. Failed payments never count.
+
+**Request statuses.** `EVALUATING -> AUTO_APPROVED | HELD | BLOCKED`; `HELD -> APPROVED | DENIED` (owner); `AUTO_APPROVED | APPROVED -> PAID | PAYMENT_FAILED`; `PAID -> REFUNDED`. The status transition and the matching payment update must happen in one transaction (`Repo.transaction`) so a request is never counted twice as in-flight and captured.
+
+**Month boundaries** come from `Intl.DateTimeFormat` with two offset passes (`src/policy/time.ts`), tested across a DST change (America/New_York, March and November 2026) and a half-hour zone (Asia/Kolkata). The demo policy uses Asia/Tokyo.

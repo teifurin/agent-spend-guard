@@ -2,7 +2,7 @@
 
 **A payment guardrail between AI agents and PayPal.** Agents never get a wallet, a card or an API key. They get one tool, `request_purchase`. The guard checks each request against the owner's rules, has an AI reviewer look for anything fishy, and only then charges PayPal. Anything outside the rules waits for a human tap. Everything is logged, and anything can be refunded with one click.
 
-> Status: milestone **M0** (scaffold and sandbox spike). PayPal AI Hackathon 2026 entry.
+> Status: **M0** scaffold done; **M1** in progress (policy engine, reason codes and SQLite schema are in and tested; the sandbox spike still has to be run). PayPal AI Hackathon 2026 entry.
 > Runs against the PayPal **sandbox only**. Every merchant, product and price in the demo is **synthetic**.
 
 ## The problem
@@ -63,12 +63,21 @@ Prerequisites: Node 22.13 or newer and a free [PayPal developer](https://develop
 
 ```
 scripts/   check-env.ts, spike-vault.ts (M0)
-src/       config/ (env loading), paypal/ (sandbox-only client, redaction)
+src/
+  config/  .env loading (Node's built-in parser, nothing is ever printed)
+  domain/  types, money (integer minor units), name normalization
+  policy/  deterministic engine, reason codes with severities, time-zone helpers, policy validation
+  db/      node:sqlite connection, migrations/001_init.sql, Repo (agents, policies, requests, decisions, payments, audit)
+  paypal/  sandbox-only REST client, redaction
 tests/     Vitest unit tests (PayPal is mocked; no network)
 docs/      HANDOFF.md (full plan), RESEARCH.md (sources), DECISIONS.md
 ```
 
-Coming next (M1–M3): policy engine, SQLite schema, MCP server, demo shopping agent, synthetic mock shop, AI risk reviewer, owner dashboard.
+How the policy engine decides is written down in [docs/DECISIONS.md](docs/DECISIONS.md) (D9: HOLD vs BLOCK, D10: budget accounting).
+
+Coming next (M2–M3): PayPal executor, MCP server, demo shopping agent, synthetic mock shop, AI risk reviewer, owner dashboard.
+
+Note for Node 22.x: the database uses the built-in `node:sqlite`, which prints a one-line `ExperimentalWarning` on 22.x. It is harmless; Node 24 prints nothing.
 
 ## AI tools used
 
