@@ -32,11 +32,11 @@ export interface ReviewOutcome {
 
 export type Reviewer = (input: ReviewInput, signal: AbortSignal) => Promise<ReviewOutcome>;
 
-/** Default reviewer: no AI, never tightens. Keeps the pipeline runnable without any key (D4). */
+/** Default when no reviewer is wired in (tests, e2e:sandbox): no AI, never tightens. The server always wires one (src/review). */
 export const passthroughReviewer: Reviewer = async () => ({
   risk: 'low',
   flags: [],
-  explanation: 'No AI review performed (mock reviewer).',
+  explanation: 'No AI review performed (passthrough: no reviewer configured).',
   recommendation: 'AUTO_APPROVE',
 });
 
