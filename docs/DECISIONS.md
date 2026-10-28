@@ -94,3 +94,20 @@ The verdict is the worst severity present. Caps and the budget are inclusive (eq
 **Request statuses.** `EVALUATING -> AUTO_APPROVED | HELD | BLOCKED`; `HELD -> APPROVED | DENIED` (owner); `AUTO_APPROVED | APPROVED -> PAID | PAYMENT_FAILED`; `PAID -> REFUNDED`. The status transition and the matching payment update must happen in one transaction (`Repo.transaction`) so a request is never counted twice as in-flight and captured.
 
 **Month boundaries** come from `Intl.DateTimeFormat` with two offset passes (`src/policy/time.ts`), tested across a DST change (America/New_York, March and November 2026) and a half-hour zone (Asia/Kolkata). The demo policy uses Asia/Tokyo.
+
+## D11. The executor: how a decision becomes a PayPal charge (2026-10-28)
+
+**Shape.** `src/guard/pipeline.ts` turns a request into a decision (policy engine, then the reviewer hook that may only tighten, then one transaction that writes the decision row, the request status and an audit entry). `src/guard/executor.ts` charges `AUTO_APPROVED` and `APPROVED` requests through the single active mandate (`Repo.activeMandate`) with Orders v2 and `payment_source.paypal.vault_id`, and refunds captures with Payments v2.
+
+**Rules.**
+
+- PayPal is never called inside a database transaction (`node:sqlite` is synchronous and transactions do not nest). The sequence is: open the payment row (`Repo.beginPayment`), call PayPal, then settle or fail in one transaction (`settlePayment`, `failPayment`, `refundPayment`), so a request is never counted both as in flight and as captured (D10).
+- PayPal-side failures are recorded, not thrown: the payment ends `FAILED`, the request `PAYMENT_FAILED`, and the audit entry carries the redacted PayPal error name, issues and debug id. Only programming errors (charging a request that is not approved) throw.
+- Three order shapes are handled: `COMPLETED` on create (what the sandbox does for vault charges), `APPROVED`/`CREATED` followed by an explicit capture, and anything else (such as `PAYER_ACTION_REQUIRED`) as a failure. A capture whose status is not `COMPLETED` is a failure that keeps the capture id.
+- Idempotency keys come from the request id (D8): `order:<requestId>`, `capture:<requestId>:<orderId>`, `refund:<requestId>:<captureId>`, and `invoice_id` is `ASG-<requestId>`, so a replay repeats every identifier. After a crash, an order id already recorded is looked up with GET instead of re-created.
+- The vault id is registered with the client's redactor before the first call and never written to audit details or logs; audit entries reference the mandate by its own id. Tests assert that the vault id appears nowhere visible.
+- The owner links PayPal once. In M1 `npm run link-paypal -- --from-spike-state` imports the token the spike saved; the interactive link flow (setup token, approval, payment token) arrives with the dashboard in M2.
+
+**Proof (`npm run e2e:sandbox`, 2026-10-28, 1.00 USD).** Request `req_90d279a61e01` on the synthetic demo agent: policy `ALLOW`, decision `AUTO_APPROVE` by policy, order `61P47474677513627` `COMPLETED` on create with capture `1FP43248JA310423N`, request `PAID`; refund `08S23452YU932140Y` `COMPLETED`, request `REFUNDED`, budget back to 0.00. Three PayPal calls in all (token, order, refund). The stamped `custom_id` (`asg:demo-agent:req_…`), `invoice_id` (`ASG-req_…`) and description were accepted.
+
+**Still unconfirmed.** PayPal's behaviour on a duplicate `invoice_id` and the exact field limits (the guard clamps at 127 characters; no 127-character field has been sent yet).

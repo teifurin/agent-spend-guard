@@ -2,7 +2,7 @@
 
 **A payment guardrail between AI agents and PayPal.** Agents never get a wallet, a card or an API key. They get one tool, `request_purchase`. The guard checks each request against the owner's rules, has an AI reviewer look for anything fishy, and only then charges PayPal. Anything outside the rules waits for a human tap. Everything is logged, and anything can be refunded with one click.
 
-> Status: **M0** done; both sandbox spikes passed on 2026-10-28 (a vault charge with the buyer absent, and a per-order approval; see [D2](docs/DECISIONS.md)). **M1** in progress: policy engine, reason codes and SQLite schema are in and tested; the PayPal executor is next. PayPal AI Hackathon 2026 entry.
+> Status: **M0** and **M1** done (2026-10-28). Both sandbox spikes passed ([D2](docs/DECISIONS.md)); the policy engine, decision pipeline and PayPal executor are in, tested, and proven with one real sandbox charge through the stored mandate and its refund ([D11](docs/DECISIONS.md)). **M2** next: MCP server, demo shopping agent, synthetic shop, owner dashboard. PayPal AI Hackathon 2026 entry.
 > Runs against the PayPal **sandbox only**. Every merchant, product and price in the demo is **synthetic**.
 
 ## The problem
@@ -52,9 +52,21 @@ Prerequisites: Node 22.13 or newer and a free [PayPal developer](https://develop
 
    Each prints an approval URL; open it and log in with the sandbox **personal** account. The script notices the approval (browser redirect, Enter, or status polling), finishes the charge and refunds it. It prints statuses and PayPal ids only.
 
-## Security model (M0)
+## M1: run the guard end to end on the sandbox
+
+After a successful `spike:vault`, store its mandate (the vault id it saved in the gitignored `.spike-state.json`) and send one synthetic request through the whole pipeline:
+
+```bash
+npm run link-paypal -- --from-spike-state   # no network: writes the mandate to data/guard.db
+npm run e2e:sandbox                          # policy -> AUTO_APPROVE -> vault charge -> PAID -> refund -> REFUNDED
+```
+
+`e2e:sandbox` seeds a synthetic demo agent with a policy (30.00 USD per purchase, 100.00 USD per month, two synthetic merchants), submits a 1.00 USD request, charges it through the mandate with the buyer absent, refunds it, and prints the decision, the PayPal ids and the audit trail. Three or four PayPal calls per run. `--amount 2.50` changes the amount, `--skip-refund` keeps the capture.
+
+## Security model
 
 - Secrets live only in `.env` (gitignored). Nothing reads it except the process itself; `npm run check-env` reports set/missing only.
+- The vault id lives only in the database (`data/guard.db`, gitignored together with its `-wal`/`-shm` files) and in `.spike-state.json`. The executor registers it with the redactor before every PayPal call, audit entries carry PayPal object ids and the guard's own mandate id only, and tests assert the vault id appears nowhere visible.
 - The PayPal client redacts bearer tokens, basic-auth values and the configured credentials from every error it raises (tested).
 - `PayPal-Request-Id` is derived from our own request ids, so retries cannot double-charge (tested).
 - `.githooks/pre-commit` refuses `.env*` and database files and runs [gitleaks](https://github.com/gitleaks/gitleaks) when installed; CI runs gitleaks over the full history.
@@ -62,20 +74,21 @@ Prerequisites: Node 22.13 or newer and a free [PayPal developer](https://develop
 ## Layout
 
 ```
-scripts/   check-env.ts, spike-vault.ts (M0)
+scripts/   check-env.ts, spike-vault.ts (M0), link-paypal.ts, e2e-sandbox.ts (M1)
 src/
   config/  .env loading (Node's built-in parser, nothing is ever printed)
   domain/  types, money (integer minor units), name normalization
   policy/  deterministic engine, reason codes with severities, time-zone helpers, policy validation
-  db/      node:sqlite connection, migrations/001_init.sql, Repo (agents, policies, requests, decisions, payments, audit)
-  paypal/  sandbox-only REST client, redaction
-tests/     Vitest unit tests (PayPal is mocked; no network)
+  db/      node:sqlite connection, migrations/001_init.sql, Repo (agents, policies, requests, decisions, payments, mandates, audit)
+  paypal/  sandbox-only REST client, redaction, Orders v2 / Payments v2 calls with idempotency keys
+  guard/   decision pipeline (policy -> reviewer hook -> decision -> charge), PayPal executor
+tests/     Vitest unit tests (PayPal is a fake fetch; no network)
 docs/      HANDOFF.md (full plan), RESEARCH.md (sources), DECISIONS.md
 ```
 
-How the policy engine decides is written down in [docs/DECISIONS.md](docs/DECISIONS.md) (D9: HOLD vs BLOCK, D10: budget accounting).
+How the guard decides and pays is written down in [docs/DECISIONS.md](docs/DECISIONS.md) (D9: HOLD vs BLOCK, D10: budget accounting, D11: the executor).
 
-Coming next (M2–M3): PayPal executor, MCP server, demo shopping agent, synthetic mock shop, AI risk reviewer, owner dashboard.
+Coming next (M2–M3): MCP server with `request_purchase`, demo shopping agent, synthetic mock shop, owner dashboard with approve/deny and refund, AI risk reviewer.
 
 Note for Node 22.x: the database uses the built-in `node:sqlite`, which prints a one-line `ExperimentalWarning` on 22.x. It is harmless; Node 24 prints nothing.
 

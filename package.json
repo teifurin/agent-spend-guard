@@ -17,9 +17,10 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "dev": "node scripts/not-yet.mjs dev M1",
+    "dev": "node scripts/not-yet.mjs dev M2",
     "demo:seed": "node scripts/not-yet.mjs demo:seed M2",
-    "e2e:sandbox": "node scripts/not-yet.mjs e2e:sandbox M1"
+    "link-paypal": "tsx scripts/link-paypal.ts",
+    "e2e:sandbox": "tsx scripts/e2e-sandbox.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

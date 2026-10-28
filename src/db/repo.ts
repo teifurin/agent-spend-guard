@@ -7,6 +7,7 @@ import type {
   AuditEntry,
   Decision,
   FinalDecision,
+  Mandate,
   Payment,
   PaymentStatus,
   Policy,
@@ -72,6 +73,17 @@ export interface RequestFilter {
   agentId?: string;
   status?: RequestStatus;
   limit?: number;
+}
+
+export interface NewMandate {
+  paypalVaultId: string;
+  paypalCustomerId?: string | null;
+}
+
+/** PayPal object ids known when a charge settles or fails. Never tokens. */
+export interface PaymentOutcome {
+  paypalOrderId?: string | null;
+  paypalCaptureId?: string | null;
 }
 
 /** Amount is committed but not yet captured: counts against the budget (DECISIONS D10). */
@@ -369,6 +381,102 @@ export class Repo {
     return row ? toPayment(row) : undefined;
   }
 
+  // -------------------------------------------------------------- mandates
+
+  /** Stores the owner's one-time PayPal authorization and makes it the only active one. The vault id is never logged. */
+  saveMandate(input: NewMandate): Mandate {
+    const mandate: Mandate = {
+      id: newId('mnd'),
+      paypalVaultId: input.paypalVaultId,
+      paypalCustomerId: input.paypalCustomerId ?? null,
+      status: 'active',
+      createdAt: this.now(),
+    };
+    this.transaction(() => {
+      this.db.prepare(`UPDATE mandates SET status = 'revoked' WHERE status = 'active'`).run();
+      this.db
+        .prepare('INSERT INTO mandates (id, paypal_vault_id, paypal_customer_id, status, created_at) VALUES (?, ?, ?, ?, ?)')
+        .run(mandate.id, mandate.paypalVaultId, mandate.paypalCustomerId, mandate.status, mandate.createdAt);
+    });
+    return mandate;
+  }
+
+  activeMandate(): Mandate | undefined {
+    const row = this.db.prepare(`SELECT * FROM mandates WHERE status = 'active' ORDER BY created_at DESC, rowid DESC LIMIT 1`).get();
+    return row ? toMandate(row) : undefined;
+  }
+
+  revokeMandate(id: string): void {
+    const result = this.db.prepare(`UPDATE mandates SET status = 'revoked' WHERE id = ?`).run(id);
+    if (result.changes === 0) throw new Error(`unknown mandate "${id}"`);
+  }
+
+  /** Newest first. */
+  listMandates(): Mandate[] {
+    return this.db.prepare('SELECT * FROM mandates ORDER BY created_at DESC, rowid DESC').all().map(toMandate);
+  }
+
+  // ------------------------------------------ payment state changes (D10)
+  // Each of these changes the request status and its payment row in ONE transaction, so a request is never
+  // counted both as in flight and as captured. They must not be called from inside another transaction.
+
+  /**
+   * Opens the payment for an approved request, or returns the payment that already exists (re-entry after a crash).
+   * The request must be AUTO_APPROVED or APPROVED.
+   */
+  beginPayment(requestId: string): Payment {
+    return this.transaction(() => {
+      const request = this.getRequest(requestId);
+      if (!request) throw new Error(`unknown request "${requestId}"`);
+      const existing = this.paymentForRequest(requestId);
+      if (existing) return existing;
+      if (request.status !== 'AUTO_APPROVED' && request.status !== 'APPROVED') {
+        throw new Error(`request "${requestId}" is ${request.status}; only AUTO_APPROVED or APPROVED requests can be charged`);
+      }
+      return this.createPayment({ requestId, agentId: request.agentId, amountMinor: request.amountMinor, currency: request.currency });
+    });
+  }
+
+  /** The capture succeeded: payment COMPLETED and request PAID. Calling it twice is harmless. */
+  settlePayment(paymentId: string, outcome: { paypalOrderId: string; paypalCaptureId: string; capturedAt: number }): Payment {
+    return this.transaction(() => {
+      const payment = this.requirePayment(paymentId);
+      if (payment.status === 'COMPLETED') return payment;
+      if (payment.status !== 'CREATED') throw new Error(`payment "${paymentId}" is ${payment.status}; only CREATED payments can settle`);
+      const updated = this.updatePayment(paymentId, { ...outcome, status: 'COMPLETED' });
+      this.setRequestStatus(payment.requestId, 'PAID');
+      return updated;
+    });
+  }
+
+  /** The charge did not happen: payment FAILED and request PAYMENT_FAILED. Nothing counts against the budget any more. */
+  failPayment(paymentId: string, outcome: PaymentOutcome = {}): Payment {
+    return this.transaction(() => {
+      const payment = this.requirePayment(paymentId);
+      if (payment.status !== 'CREATED') throw new Error(`payment "${paymentId}" is ${payment.status}; only CREATED payments can fail`);
+      const updated = this.updatePayment(paymentId, { ...outcome, status: 'FAILED' });
+      this.setRequestStatus(payment.requestId, 'PAYMENT_FAILED');
+      return updated;
+    });
+  }
+
+  /** The capture was refunded: payment REFUNDED and request REFUNDED, which gives the budget back. */
+  refundPayment(paymentId: string, paypalRefundId: string): Payment {
+    return this.transaction(() => {
+      const payment = this.requirePayment(paymentId);
+      if (payment.status !== 'COMPLETED') throw new Error(`payment "${paymentId}" is ${payment.status}; only COMPLETED payments can be refunded`);
+      const updated = this.updatePayment(paymentId, { paypalRefundId, status: 'REFUNDED' });
+      this.setRequestStatus(payment.requestId, 'REFUNDED');
+      return updated;
+    });
+  }
+
+  private requirePayment(id: string): Payment {
+    const payment = this.getPayment(id);
+    if (!payment) throw new Error(`unknown payment "${id}"`);
+    return payment;
+  }
+
   // ----------------------------------------------------- budget and history
 
   /**
@@ -490,6 +598,16 @@ function toPayment(row: Row): Payment {
     capturedAt: numOrNull(row['captured_at']),
     createdAt: num(row['created_at']),
     updatedAt: num(row['updated_at']),
+  };
+}
+
+function toMandate(row: Row): Mandate {
+  return {
+    id: str(row['id']),
+    paypalVaultId: str(row['paypal_vault_id']),
+    paypalCustomerId: strOrNull(row['paypal_customer_id']),
+    status: str(row['status']) as Mandate['status'],
+    createdAt: num(row['created_at']),
   };
 }
 

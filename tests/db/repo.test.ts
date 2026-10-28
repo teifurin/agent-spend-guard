@@ -244,3 +244,77 @@ describe('audit log', () => {
     expect(repo.listAudit()).toHaveLength(1);
   });
 });
+
+describe('mandates', () => {
+  it('keeps exactly one active mandate and never more', () => {
+    const { repo } = setup();
+    expect(repo.activeMandate()).toBeUndefined();
+    const first = repo.saveMandate({ paypalVaultId: 'vault-one-000000', paypalCustomerId: 'cust1' });
+    expect(repo.activeMandate()).toEqual(first);
+    const second = repo.saveMandate({ paypalVaultId: 'vault-two-000000' });
+    expect(repo.activeMandate()?.id).toBe(second.id);
+    expect(repo.listMandates().map((m) => [m.id, m.status])).toEqual([
+      [second.id, 'active'],
+      [first.id, 'revoked'],
+    ]);
+    repo.revokeMandate(second.id);
+    expect(repo.activeMandate()).toBeUndefined();
+    expect(() => repo.revokeMandate('mnd_nope')).toThrow('unknown mandate');
+  });
+});
+
+describe('payment state changes (D10)', () => {
+  function approved(amountMinor = 1200) {
+    const ctx = setup();
+    const request = ctx.repo.createRequest({ ...baseRequest, amountMinor });
+    ctx.repo.setRequestStatus(request.id, 'AUTO_APPROVED');
+    return { ...ctx, request };
+  }
+
+  it('beginPayment needs an approved request and returns the same payment on re-entry', () => {
+    const { repo, request } = approved();
+    const payment = repo.beginPayment(request.id);
+    expect(payment).toMatchObject({ requestId: request.id, agentId: 'research-bot', amountMinor: 1200, currency: 'USD', status: 'CREATED' });
+    expect(repo.beginPayment(request.id)).toEqual(payment);
+
+    const held = repo.createRequest(baseRequest);
+    repo.setRequestStatus(held.id, 'HELD');
+    expect(() => repo.beginPayment(held.id)).toThrow('only AUTO_APPROVED or APPROVED');
+    expect(() => repo.beginPayment('req_nope')).toThrow('unknown request');
+  });
+
+  it('settlePayment marks the request PAID in the same step and moves the amount from in-flight to captured', () => {
+    const { repo, request } = approved();
+    const payment = repo.beginPayment(request.id);
+    expect(repo.spentThisMonthMinor('research-bot', OCT_27_NOON_JST, 'Asia/Tokyo')).toBe(1200); // in flight
+    const settled = repo.settlePayment(payment.id, { paypalOrderId: 'O1', paypalCaptureId: 'C1', capturedAt: OCT_27_NOON_JST });
+    expect(settled).toMatchObject({ status: 'COMPLETED', paypalOrderId: 'O1', paypalCaptureId: 'C1', capturedAt: OCT_27_NOON_JST });
+    expect(repo.getRequest(request.id)?.status).toBe('PAID');
+    expect(repo.spentThisMonthMinor('research-bot', OCT_27_NOON_JST, 'Asia/Tokyo')).toBe(1200); // captured, counted once
+    expect(repo.settlePayment(payment.id, { paypalOrderId: 'O1', paypalCaptureId: 'C1', capturedAt: 1 })).toEqual(settled);
+    expect(() => repo.failPayment(payment.id)).toThrow('only CREATED payments can fail');
+  });
+
+  it('failPayment marks the request PAYMENT_FAILED and frees the budget', () => {
+    const { repo, request } = approved();
+    const payment = repo.beginPayment(request.id);
+    const failed = repo.failPayment(payment.id, { paypalOrderId: 'O2' });
+    expect(failed).toMatchObject({ status: 'FAILED', paypalOrderId: 'O2', paypalCaptureId: null });
+    expect(repo.getRequest(request.id)?.status).toBe('PAYMENT_FAILED');
+    expect(repo.spentThisMonthMinor('research-bot', OCT_27_NOON_JST, 'Asia/Tokyo')).toBe(0);
+    expect(() => repo.settlePayment(payment.id, { paypalOrderId: 'O2', paypalCaptureId: 'C2', capturedAt: 1 })).toThrow('only CREATED payments can settle');
+    expect(() => repo.failPayment('pay_nope')).toThrow('unknown payment');
+  });
+
+  it('refundPayment marks the request REFUNDED, gives the budget back and rejects anything not completed', () => {
+    const { repo, request } = approved();
+    const payment = repo.beginPayment(request.id);
+    expect(() => repo.refundPayment(payment.id, 'R0')).toThrow('only COMPLETED payments can be refunded');
+    repo.settlePayment(payment.id, { paypalOrderId: 'O3', paypalCaptureId: 'C3', capturedAt: OCT_27_NOON_JST });
+    const refunded = repo.refundPayment(payment.id, 'R3');
+    expect(refunded).toMatchObject({ status: 'REFUNDED', paypalRefundId: 'R3' });
+    expect(repo.getRequest(request.id)?.status).toBe('REFUNDED');
+    expect(repo.spentThisMonthMinor('research-bot', OCT_27_NOON_JST, 'Asia/Tokyo')).toBe(0);
+    expect(repo.knownMerchants('research-bot')).toEqual(['synthetic books']);
+  });
+});
