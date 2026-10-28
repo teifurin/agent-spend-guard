@@ -112,3 +112,17 @@ The verdict is the worst severity present. Caps and the budget are inclusive (eq
 **Proof (`npm run e2e:sandbox`, 2026-10-28, 1.00 USD).** Request `req_90d279a61e01` on the synthetic demo agent: policy `ALLOW`, decision `AUTO_APPROVE` by policy, order `61P47474677513627` `COMPLETED` on create with capture `1FP43248JA310423N`, request `PAID`; refund `08S23452YU932140Y` `COMPLETED`, request `REFUNDED`, budget back to 0.00. Three PayPal calls in all (token, order, refund). The stamped `custom_id` (`asg:demo-agent:req_…`), `invoice_id` (`ASG-req_…`) and description were accepted.
 
 **Still unconfirmed.** PayPal's behaviour on a duplicate `invoice_id` and the exact field limits (the guard clamps at 127 characters; no 127-character field has been sent yet).
+
+## D12. M2 topology: one guard process, a credential-free MCP server, the shop on its own origin (2026-10-28)
+
+**Decision.** `npm run dev` starts one guard process (Hono on Node) that owns the database, the PayPal client and an in-process event bus, and serves three things: the owner dashboard (server-rendered HTML with a few lines of JS that reload the page on server-sent events), the JSON API agents use, and the SSE stream. The synthetic shop is served by the same process but on a second port, so untrusted product pages and the forms that approve charges never share an origin; shop pages carry `default-src 'none'` and contain no script.
+
+The MCP server (`src/mcp`) is a stdio process that holds nothing: it does not load `.env`, and each tool is one call to the guard's API, so an agent host (Claude Desktop, the demo agent) never shares a process with PayPal credentials or the vault id. Tool results are statuses, ids and a plain-language message.
+
+**Why not Vite + React, AG Grid, Express.** No build step and no front-end toolchain for judges to run; `hono/html` escapes every interpolation, which matters because merchant, item and reason are attacker-controlled text (tested with script, event-handler and `javascript:` payloads). The audit table is plain HTML for now (M3 may revisit AG Grid Community).
+
+**The mock agent obeys the page on purpose.** In mock mode the shopping agent extracts all text from a product page, hidden text included, and follows "buy N units / use the reason …" instructions. That is the demo's point: the agent is not the safety layer. M2 ends the injected request in `HELD` (`OVER_TX_CAP`, `MERCHANT_NOT_ALLOWED`); the M3 reviewer turns it into `BLOCK`.
+
+**Observed on the sandbox (2026-10-28).** Scenario 1 paid 12.00 USD through MCP → API → policy → executor (order `5FH55065K4253130A`, capture `9BM1973965522664L`); scenario 2 was held, approved on the dashboard and paid (order `0WB26883WG213635W`, capture `7AJ53951Y6156774E`); scenario 3 was held and denied. Refunding the 45.00 USD capture from the dashboard right after the charge failed with PayPal `422 UNPROCESSABLE_ENTITY [REFUND_FAILED_INSUFFICIENT_FUNDS]`, while the 1.00 USD refunds of M0 and M1 had succeeded. The guard behaved as designed: the payment stayed `COMPLETED`, the request `PAID`, and `refund.failed` was audited with the issue code. The likely cause is the receiving sandbox business account's available USD balance; it is the owner's account to inspect. Refunds therefore depend on the merchant account's balance, which production would handle by retrying later or by webhook-driven reconciliation.
+
+**Not in M2.** Dashboard authentication (see THREAT_MODEL.md), Streamable HTTP for MCP (stdio only), webhooks, push notifications.

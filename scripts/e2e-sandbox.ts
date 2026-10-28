@@ -20,8 +20,9 @@ import { PayPalExecutor } from '../src/guard/executor.js';
 import { Guard } from '../src/guard/pipeline.js';
 import { PayPalApiError, PayPalClient } from '../src/paypal/client.js';
 import { loadPayPalConfig } from '../src/paypal/env.js';
+import { DEMO_AGENT_ID, seedDemo } from '../src/demo/seed.js';
 
-const AGENT_ID = 'demo-agent';
+const AGENT_ID = DEMO_AGENT_ID;
 
 interface Args {
   amountMinor: number;
@@ -56,21 +57,9 @@ async function main(): Promise<void> {
   const repo = new Repo(openDatabase(dbPath));
   console.log(`agent-spend-guard M1 end-to-end | amount=${formatAmount(args.amountMinor)} USD | PayPal SANDBOX only | db=${dbPath}`);
 
-  // Synthetic demo agent and policy (idempotent).
-  if (!repo.getAgent(AGENT_ID)) repo.createAgent({ id: AGENT_ID, name: 'Demo shopping agent (synthetic)' });
-  repo.savePolicy({
-    agentId: AGENT_ID,
-    currency: 'USD',
-    maxTxMinor: 3000,
-    hardMaxTxMinor: 20000,
-    monthlyBudgetMinor: 10000,
-    merchantAllowlist: ['Synthetic Books', 'Synthetic Supplies'],
-    categoryAllowlist: null,
-    hours: null,
-    timezone: 'Asia/Tokyo',
-    holdNewMerchants: true,
-  });
-  console.log(`[ok] agent ${AGENT_ID}: policy max 30.00 USD per purchase, 100.00 USD per month, two synthetic merchants`);
+  // The same synthetic demo agent and rules as `npm run demo:seed` (idempotent).
+  seedDemo(repo);
+  console.log(`[ok] agent ${AGENT_ID}: policy max 30.00 USD per purchase, 100.00 USD per month, two synthetic merchants, 08:00-22:00 Tokyo time`);
 
   const mandate = repo.activeMandate();
   if (!mandate) {

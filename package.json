@@ -17,8 +17,10 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
-    "dev": "node scripts/not-yet.mjs dev M2",
-    "demo:seed": "node scripts/not-yet.mjs demo:seed M2",
+    "dev": "tsx src/server/main.ts",
+    "mcp": "tsx src/mcp/main.ts",
+    "demo:agent": "tsx scripts/demo-agent.ts",
+    "demo:seed": "tsx scripts/demo-seed.ts",
     "link-paypal": "tsx scripts/link-paypal.ts",
     "e2e:sandbox": "tsx scripts/e2e-sandbox.ts"
   },
@@ -30,5 +32,11 @@
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.72.1",
     "vitest": "^5.0.5"
+  },
+  "dependencies": {
+    "@hono/node-server": "^2.1.5",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "hono": "^4.13.14",
+    "zod": "^4.6.7"
   }
 }
