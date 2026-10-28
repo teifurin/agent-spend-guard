@@ -52,7 +52,7 @@ function parseArgs(argv: string[]): Args {
     if (a === '--scenario') {
       const n = Number(argv[++i]);
       const s = SCENARIOS.find((x) => x.n === n);
-      if (!s) throw new Error('--scenario must be 1, 2 or 3');
+      if (!s) throw new Error('--scenario must be 1, 2, 3 or 4');
       args.scenarios = [s];
     } else if (a === '--wait') {
       args.waitSeconds = Math.max(0, Number(argv[++i] ?? '0'));

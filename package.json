@@ -22,7 +22,8 @@
     "demo:agent": "tsx scripts/demo-agent.ts",
     "demo:seed": "tsx scripts/demo-seed.ts",
     "link-paypal": "tsx scripts/link-paypal.ts",
-    "e2e:sandbox": "tsx scripts/e2e-sandbox.ts"
+    "e2e:sandbox": "tsx scripts/e2e-sandbox.ts",
+    "e2e:offline": "tsx scripts/e2e-sandbox.ts --offline"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
