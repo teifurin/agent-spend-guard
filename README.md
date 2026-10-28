@@ -2,7 +2,7 @@
 
 **A payment guardrail between AI agents and PayPal.** Agents never get a wallet, a card or an API key. They get one tool, `request_purchase`. The guard checks each request against the owner's rules, has an AI reviewer look for anything fishy, and only then charges PayPal. Anything outside the rules waits for a human tap. Everything is logged, and anything can be refunded with one click.
 
-> Status: **M0** scaffold done; **M1** in progress (policy engine, reason codes and SQLite schema are in and tested; the sandbox spike still has to be run). PayPal AI Hackathon 2026 entry.
+> Status: **M0** done; both sandbox spikes passed on 2026-10-28 (a vault charge with the buyer absent, and a per-order approval; see [D2](docs/DECISIONS.md)). **M1** in progress: policy engine, reason codes and SQLite schema are in and tested; the PayPal executor is next. PayPal AI Hackathon 2026 entry.
 > Runs against the PayPal **sandbox only**. Every merchant, product and price in the demo is **synthetic**.
 
 ## The problem

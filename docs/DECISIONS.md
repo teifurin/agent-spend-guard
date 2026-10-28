@@ -10,17 +10,33 @@ Architecture decision log, oldest first. Each entry says what was decided, why, 
 
 **Revisit.** Never, for this project.
 
-## D2. How the guard moves money: Plan A (vault) first, Plan B (per-order approval) as fallback. PENDING the M0 spike
+## D2. How the guard moves money: Plan A (vault), decided by the M0 spike (2026-10-28)
 
 **Plan A.** Payment Method Tokens v3. The owner approves a setup token once with their PayPal (sandbox personal) account; the guard exchanges it for a payment token (`vault_id`) and charges policy-approved requests with Orders v2 `payment_source.paypal.vault_id`, buyer absent. Refunds via Payments v2.
 
 **Plan B.** Every charge is an ordinary Orders v2 order with a payer-action link that the owner opens; the guard captures after approval.
 
-**Risk.** The vault guide says: "You must be approved and have your account configured for billing agreements to set up a reference transaction." Whether a fresh sandbox app has this is only answerable by running `npm run spike:vault`.
+**Risk that did not materialise.** The vault guide says: "You must be approved and have your account configured for billing agreements to set up a reference transaction." A fresh sandbox REST app with *Accept payments* and *Vault* ticked needed no further approval.
 
-**Design option kept open: hybrid.** AUTO_APPROVE charges the vault; HOLD sends the owner a PayPal approve link for that specific order, so PayPal's own checkout is the human-in-the-loop step. The product still works if vault is unavailable (then every charge is Plan B).
+**Spike result, Plan A (`npm run spike:vault`, run 20261028044428, 1.00 USD, US personal buyer).** Statuses and ids only; the vault id itself lives in the gitignored `.spike-state.json`.
 
-**Status.** Open. The decision and the spike output (statuses and ids only) will be recorded here after the owner runs both spike modes.
+| step | result |
+| --- | --- |
+| `POST /v3/vault/setup-tokens` | 201, `PAYER_ACTION_REQUIRED`, id `56H41380NR184072M` |
+| owner approval | browser redirect to `127.0.0.1:8787/return`; token `APPROVED` |
+| `POST /v3/vault/payment-tokens` | 201, payment token created (masked `9uc...3j`) |
+| `POST /v2/checkout/orders` with `vault_id`, buyer absent | 201, order `55M30185U89391303` returned **`COMPLETED` on create**, capture `7YX66140XX426782L` (no separate capture call) |
+| `POST /v2/payments/captures/{id}/refund` | 201, refund `3VT19252072297030` `COMPLETED` |
+
+A first run the same day timed out after 10 minutes because the approval page was not opened in time; nothing was charged and the unused setup token simply expired.
+
+**Spike result, Plan B (`npm run spike:order`, run 20261028044826, 1.00 USD, same buyer).** `POST /v2/checkout/orders` with `experience_context` and `user_action: PAY_NOW` returned `PAYER_ACTION_REQUIRED`, order `04L9549118260180V`; after the owner approved in PayPal checkout (redirect caught the same way) the order read `APPROVED`, `POST .../capture` gave capture `7UB02637BE104741F` `COMPLETED`, and the refund `1HH20177WF753424B` completed. So both paths work on this app.
+
+**Decision.** The executor charges with `vault_id`. The owner links PayPal once (a *mandate*, stored in the `mandates` table), and both `AUTO_APPROVE` and an owner-approved `HOLD` are charged through that mandate; the human-in-the-loop step is the guard's own dashboard, not PayPal's checkout page. Plan B stays as the documented fallback for an account without vault, and the `spike:order` mode stays in the repo to prove it.
+
+**Consequences for the executor.** Handle both shapes of the create-order response: `COMPLETED` on create (what the sandbox did here) and `APPROVED`/`CREATED` that needs an explicit capture. Give the approval wait in the dashboard's "link PayPal" step a generous timeout. Keep every order stamped as D3 says.
+
+**Still unconfirmed by the spike.** Duplicate `invoice_id` behaviour and the maximum lengths of `custom_id` and `description` (both runs used unique ids and short strings).
 
 ## D3. Who gets paid: the guard is a wallet operator, not a merchant (2026-10-27)
 
