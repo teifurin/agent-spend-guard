@@ -2,7 +2,7 @@
 
 **A payment guardrail between AI agents and PayPal.** Agents never get a wallet, a card or an API key. They get one tool, `request_purchase`. The guard checks each request against the owner's rules, has an AI reviewer look for anything fishy, and only then charges PayPal. Anything outside the rules waits for a human tap. Everything is logged, and anything can be refunded with one click.
 
-> Status: **M0–M3** done (2026-10-28). Policy engine, decision pipeline and PayPal executor ([D11](docs/DECISIONS.md)); MCP server, mock shopping agent, synthetic shop and owner dashboard with live updates ([D12](docs/DECISIONS.md)); the AI risk reviewer with a mock mode and an Anthropic mode, the injected request now ending in BLOCK, price anomalies, a phone-sized dashboard ([D13](docs/DECISIONS.md)). The whole loop has run against the sandbox: a request auto-paid through the mandate, a held one approved and paid from the dashboard, an injected one stopped. **M4** next: fresh-clone reproduction and the owner's own test run. PayPal AI Hackathon 2026 entry.
+> Status: **M0–M4** done (2026-10-28). Policy engine, decision pipeline and PayPal executor ([D11](docs/DECISIONS.md)); MCP server, mock shopping agent, synthetic shop and owner dashboard with live updates ([D12](docs/DECISIONS.md)); the AI risk reviewer with a mock mode and an Anthropic mode, the injected request ending in BLOCK, price anomalies, a phone-sized dashboard ([D13](docs/DECISIONS.md)); one end-to-end run that plays all four scenarios on the sandbox or, without an account, against a fake PayPal, reproduced from a fresh clone, CI on Node 22 and 24 ([D14](docs/DECISIONS.md)). The whole loop has run against the sandbox: a request auto-paid through the mandate, a held one approved and paid from the dashboard, an injected one stopped. Next: the demo video and the Devpost submission. PayPal AI Hackathon 2026 entry.
 > Runs against the PayPal **sandbox only**. Every merchant, product and price in the demo is **synthetic**.
 
 ## The problem
@@ -27,6 +27,21 @@ Key properties:
 - **Sandbox only, by construction.** The sandbox host is hard-coded and the process refuses to start with `PAYPAL_ENV` set to anything else.
 
 Full plan: [docs/HANDOFF.md](docs/HANDOFF.md). Decisions and open questions: [docs/DECISIONS.md](docs/DECISIONS.md).
+
+## Reproduce it
+
+Without a PayPal account, which is also what CI runs (Node 22.13 or newer):
+
+```bash
+npm ci
+npm test               # 23 files, 232 tests; PayPal and the model are fakes, no network
+npm run e2e:offline    # the four scenarios, charge and refund included, against a fake PayPal
+                       # ends with: VERDICT: 4/4 scenarios as expected, 2/2 refunds completed.
+npm run dev            # dashboard on http://localhost:3000, keyless: decisions only, nothing charged
+npm run demo:agent -- --wait 0   # second terminal: the mock agent plays the four scenarios through MCP
+```
+
+With your own sandbox account: M0 (the spike) and M1 (`e2e:sandbox`, the same four scenarios with real sandbox charges and refunds), then M2 (the dashboard and the agent). Nothing in this repository can talk to live PayPal.
 
 ## M0: run the sandbox spike
 
@@ -54,14 +69,14 @@ Prerequisites: Node 22.13 or newer and a free [PayPal developer](https://develop
 
 ## M1: run the guard end to end on the sandbox
 
-After a successful `spike:vault`, store its mandate (the vault id it saved in the gitignored `.spike-state.json`) and send one synthetic request through the whole pipeline:
+After a successful `spike:vault`, store its mandate (the vault id it saved in the gitignored `.spike-state.json`) and play the four demo scenarios through the whole pipeline against the sandbox:
 
 ```bash
-npm run link-paypal -- --from-spike-state   # no network: writes the mandate to data/guard.db
-npm run e2e:sandbox                          # policy -> AUTO_APPROVE -> vault charge -> PAID -> refund -> REFUNDED
+npm run link-paypal -- --from-spike-state   # no network: writes the mandate to data/guard.db (the dashboard's PayPal page does the same with one approval)
+npm run e2e:sandbox                          # four scenarios, the owner's part scripted, both captures refunded
 ```
 
-`e2e:sandbox` seeds the synthetic demo agent with the demo rules (30.00 USD per purchase, 100.00 USD per month, two synthetic merchants, purchases only between 08:00 and 22:00 Tokyo time), submits a 1.00 USD request, charges it through the mandate with the buyer absent, refunds it, and prints the decision, the PayPal ids and the audit trail. Three or four PayPal calls per run. Outside the demo hours the request is held instead of paid, which is the rules working. `--amount 2.50` changes the amount, `--skip-refund` keeps the capture.
+`e2e:sandbox` runs in a fresh, gitignored database (`.tmp-e2e/`), copies the active mandate from `data/guard.db` into it, seeds the demo rules (30.00 USD per purchase, 100.00 USD per month, two synthetic merchants, purchases only between 08:00 and 22:00 Tokyo time) and plays the scenarios of the table in M2 with the owner scripted: the notebook is paid through the mandate with the buyer absent; the microscope is held, approved and paid; the hostile pens page is blocked with no PayPal call (the run counts them); the repriced notebook is held by the reviewer and denied; then both captures are refunded. Five to seven PayPal calls, 57.00 USD charged and refunded, every id printed, no credential. It refuses to start outside the demo hours, because scenario 1 would be held instead of paid, which is the rules working. `--skip-refund` keeps the captures; `--mandate-from` and `--db` pick other databases. With `LLM_PROVIDER=anthropic` in `.env` the same run uses the real reviewer: one model call per request, four in all. `npm run e2e:offline` is the same run with a fake PayPal, the mock reviewer and a pinned clock, for machines without an account.
 
 ## M2: run the whole loop locally
 
@@ -118,12 +133,12 @@ The design, the flag vocabulary and why the model cannot loosen anything: [D13](
 - The vault id lives only in the database (`data/guard.db`, gitignored together with its `-wal`/`-shm` files) and in `.spike-state.json`. The executor registers it with the redactor before every PayPal call, audit entries carry PayPal object ids and the guard's own mandate id only, and tests assert the vault id appears nowhere visible.
 - The PayPal client redacts bearer tokens, basic-auth values and the configured credentials from every error it raises (tested).
 - `PayPal-Request-Id` is derived from our own request ids, so retries cannot double-charge (tested).
-- `.githooks/pre-commit` refuses `.env*` and database files and runs [gitleaks](https://github.com/gitleaks/gitleaks) when installed; CI runs gitleaks over the full history.
+- `.githooks/pre-commit` refuses `.env*` and database files and runs [gitleaks](https://github.com/gitleaks/gitleaks) when installed; CI runs gitleaks over the full history. `npm run e2e:offline` never reads `.env`; its PayPal credentials are placeholders for a fake that answers in-process.
 
 ## Layout
 
 ```
-scripts/   check-env.ts, spike-vault.ts (M0), link-paypal.ts, e2e-sandbox.ts (M1), demo-seed.ts, demo-agent.ts (M2)
+scripts/   check-env.ts, spike-vault.ts (M0), link-paypal.ts, e2e-sandbox.ts (the four scenarios on the sandbox, or offline), demo-seed.ts, demo-agent.ts (M2)
 src/
   config/  .env loading (Node's built-in parser, nothing is ever printed)
   domain/  types, money (integer minor units), name normalization
@@ -136,14 +151,14 @@ src/
   mcp/     MCP server (stdio) exposing request_purchase, get_request_status, get_budget; no credentials
   shop/    the synthetic shop: five product pages (one hostile, one repriced), own origin, strict CSP
   agent/   the mock shopping agent's page reading and purchase planning
-  demo/    the demo agent and rules used by seed, e2e and tests
-tests/     Vitest unit tests (PayPal and the LLM provider are fake fetches; the MCP server and the shop are driven in memory; no network)
+  demo/    the demo agent and rules (seed), the end-to-end run (e2e.ts), the fake PayPal for offline runs
+tests/     Vitest tests (PayPal and the LLM provider are fake fetches; the MCP server, the shop and the end-to-end run are driven in memory; no network)
 docs/      HANDOFF.md (full plan), RESEARCH.md (sources), DECISIONS.md, THREAT_MODEL.md
 ```
 
-How the guard decides and pays is written down in [docs/DECISIONS.md](docs/DECISIONS.md) (D9: HOLD vs BLOCK, D10: budget accounting, D11: the executor, D12: the M2 topology, D13: the reviewer).
+How the guard decides and pays is written down in [docs/DECISIONS.md](docs/DECISIONS.md) (D9: HOLD vs BLOCK, D10: budget accounting, D11: the executor, D12: the M2 topology, D13: the reviewer, D14: the end-to-end run).
 
-Coming next (M4): reproduction from a fresh clone, the full-history secret scan, the owner's own test run. Not built: an AG Grid audit table (plain HTML for now, see D13), push notifications, webhooks.
+Coming next: the demo video and the Devpost submission. Not built: an AG Grid audit table (plain HTML for now, see D13), push notifications, webhooks, a real-LLM mode for the shopping agent (the agent is the mock; the reviewer is where the model goes).
 
 Note for Node 22.x: the database uses the built-in `node:sqlite`, which prints a one-line `ExperimentalWarning` on 22.x. It is harmless; Node 24 prints nothing.
 

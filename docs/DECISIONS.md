@@ -146,3 +146,18 @@ Two implementations behind one interface. `LLM_PROVIDER=mock` (the default) is `
 **Demo.** Scenario 3 (the hostile pens page) now ends BLOCKED in both modes: the fetched page contains instructions aimed at agents, the reason claims the owner's approval, and ten units is unusual. Scenario 4 (the notebook relisted at 29.00, inside the rules) ends HELD with `PRICE_ANOMALY` once scenario 1 is in the history. The shop therefore has five products, two of them the same notebook.
 
 **Caveat recorded, not fixed.** While a review runs, the request sits in `EVALUATING`, which D10's in-flight budget does not count; two requests submitted at the same moment can both pass the budget check. Production would reserve the amount before the review.
+
+## D14. Reproduction: one end-to-end run, for the sandbox and for judges without an account (2026-10-28)
+
+**Decision.** `scripts/e2e-sandbox.ts` plays the same four scenarios as the demo agent through the real pipeline (product page → mock agent → rules → reviewer → decision → executor), with the owner's part scripted (approve scenario 2, deny scenario 4) and both captures refunded at the end; every expectation is checked and the run exits non-zero when one fails. The flow is `src/demo/e2e.ts`, so the tests run it against a fake PayPal. Two modes, one code path:
+
+- `npm run e2e:sandbox`: a fresh, gitignored database per run (`.tmp-e2e/`) with the active mandate copied in from `data/guard.db`, so the month's budget starts at zero and the result does not depend on what the dashboard's database already holds; it refuses to start outside the demo hours (scenario 1 would be held, not paid); it loads the reviewer from the environment exactly as the server does, so a bad `LLM_PROVIDER` fails closed before anything is sent. Five to seven PayPal calls: a token, one or two per charge, one per refund.
+- `npm run e2e:offline`: `src/demo/fake-paypal.ts` answers the token, order and refund endpoints in-process with made-up ids; the reviewer is the mock whatever the environment says; the clock is pinned to 2026-10-28 12:00 Tokyo time; `.env` is not read. CI runs it on Node 22 and 24 after the tests.
+
+**Why scenario 3 counts PayPal calls.** HANDOFF §9 promises "BLOCKED, no PayPal call". The run wraps the client's fetch with a counter and fails the scenario if a blocked request produced one; nothing else proves that claim end to end.
+
+**Why scenario 4 is denied rather than approved.** It shows the deny path, leaves no held request behind, and keeps the sandbox spend at 57.00 USD per run (12.00 + 45.00, both refunded).
+
+**Why the fake lives in `src/demo` and not only in the tests.** A judge without a PayPal account should see the whole loop, charge and refund included, with one command and no network; the tests keep their own, smaller fakes.
+
+**What this does not prove.** The sandbox run spends sandbox money and needs the owner's mandate, so it is the owner's to execute; the real model path is exercised only when `LLM_PROVIDER=anthropic` is set for a sandbox run.
