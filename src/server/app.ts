@@ -17,6 +17,7 @@ import type { PayPalClient } from '../paypal/client.js';
 import { createPaymentToken, createSetupToken, getSetupToken } from '../paypal/vault.js';
 import { monthBounds } from '../policy/time.js';
 import { validatePolicy } from '../policy/validate.js';
+import { FLAG_RISK, FLAG_TEXT, type ReviewFlag } from '../review/flags.js';
 import type { EventBus } from './events.js';
 
 export interface AppDeps {
@@ -33,6 +34,8 @@ export interface AppDeps {
   now?: () => number;
   /** SSE keep-alive interval. */
   heartbeatMs?: number;
+  /** Which AI reviewer is active, shown on the dashboard so mock mode is never mistaken for a model. */
+  reviewer?: { label: string; mock: boolean };
 }
 
 // ------------------------------------------------------------------ API schema
@@ -69,7 +72,7 @@ const MESSAGES: Record<RequestStatus, string> = {
   EVALUATING: 'Being evaluated.',
   AUTO_APPROVED: 'Approved by policy; the charge is in progress.',
   HELD: 'Held for the owner. Poll get_request_status for their decision; do not retry the purchase.',
-  BLOCKED: 'Blocked by policy. Do not retry.',
+  BLOCKED: 'Blocked. Do not retry.',
   APPROVED: 'The owner approved it; the charge is in progress.',
   DENIED: 'The owner denied it. Do not retry.',
   PAID: 'Paid. The owner can refund it from the dashboard.',
@@ -81,6 +84,13 @@ export function requestView(repo: Repo, request: PurchaseRequest) {
   const decision = repo.latestDecision(request.id);
   const payment = repo.paymentForRequest(request.id);
   const reasons = decision?.policyReasons ?? [];
+  const review = decision && (decision.reviewRisk !== null || decision.reviewFlags.length > 0) ? { risk: decision.reviewRisk, flags: decision.reviewFlags, explanation: decision.reviewExplanation } : null;
+  // Agents learn why they were held or blocked (flags and the reviewer's sentence), nothing about the owner's PayPal side.
+  // A low-risk review of a request the rules held adds nothing, so it stays out of the message.
+  const reviewMessage =
+    review && (request.status === 'HELD' || request.status === 'BLOCKED') && (review.flags.length > 0 || (review.risk !== null && review.risk !== 'low'))
+      ? `${review.flags.length > 0 ? ` AI review flags: ${review.flags.join(', ')}.` : ''}${review.explanation ? ` ${review.explanation}` : ''}`
+      : '';
   return {
     request_id: request.id,
     agent_id: request.agentId,
@@ -98,12 +108,12 @@ export function requestView(repo: Repo, request: PurchaseRequest) {
           final: decision.finalDecision,
           policy_verdict: decision.policyVerdict,
           reasons: reasons.map((r) => ({ code: r.code, message: r.message })),
-          review: decision.reviewRisk === null && decision.reviewFlags.length === 0 ? null : { risk: decision.reviewRisk, flags: decision.reviewFlags, explanation: decision.reviewExplanation },
+          review,
           decided_by: decision.decidedBy,
         }
       : null,
     payment: payment ? { status: payment.status, paypal_order_id: payment.paypalOrderId, paypal_capture_id: payment.paypalCaptureId, paypal_refund_id: payment.paypalRefundId } : null,
-    message: `${MESSAGES[request.status]}${reasons.length > 0 ? ` Reasons: ${reasons.map((r) => r.message).join('; ')}` : ''}`,
+    message: `${MESSAGES[request.status]}${reasons.length > 0 ? ` Reasons: ${reasons.map((r) => r.message).join('; ')}.` : ''}${reviewMessage}`,
   };
 }
 
@@ -163,10 +173,24 @@ const CSS = `
   .notice { background: #ecfdf5; border: 1px solid #a7f3d0; padding: 10px 14px; border-radius: 8px; margin: 10px 0; }
   .error { background: #fef2f2; border: 1px solid #fecaca; padding: 10px 14px; border-radius: 8px; margin: 10px 0; }
   .reason { background: #fff7ed; border-left: 3px solid #f59e0b; padding: 6px 10px; margin: 6px 0; font-size: 14px; }
+  .review { background: #f5f3ff; border-left: 3px solid #7c3aed; padding: 6px 10px; margin: 6px 0; font-size: 14px; }
+  .chip { display: inline-block; padding: 1px 7px; border-radius: 6px; font-size: 11px; font-weight: 600; background: #f1f5f9; color: #334155; border: 1px solid #e2e8f0; margin: 2px 4px 0 0; white-space: nowrap; }
+  .chip.bad { background: #fee2e2; color: #991b1b; border-color: #fecaca; } .chip.hold { background: #fef3c7; color: #92400e; border-color: #fde68a; }
   pre { white-space: pre-wrap; word-break: break-word; background: #f8fafc; padding: 8px; border-radius: 6px; font-size: 12px; }
   .mono { font-family: ui-monospace, monospace; font-size: 13px; }
   .wrap { word-break: break-word; }
-  @media (max-width: 600px) { th:nth-child(n+5), td:nth-child(n+5) { display: none; } main { padding: 10px; } }
+  @media (max-width: 600px) {
+    th:nth-child(n+5), td:nth-child(n+5), .requests th:first-child, .requests td:first-child { display: none; }
+    table { display: block; max-width: 100%; overflow-x: auto; }
+    .chip { font-size: 10px; padding: 1px 5px; }
+    main { padding: 10px; } h1 { font-size: 20px; } .card { padding: 12px; }
+    header { gap: 10px; padding: 10px 12px; } header a { font-size: 14px; }
+    button, .btn { min-height: 44px; padding: 10px 14px; }
+    .actions.decide { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .actions.decide form, .actions.decide .btn { width: 100%; } .actions.decide form button { width: 100%; } .actions.decide .btn { grid-column: 1 / -1; text-align: center; }
+    input, select { font-size: 16px; }
+    .mono { font-size: 12px; }
+  }
 `;
 
 const LIVE_JS = `
@@ -223,20 +247,46 @@ const badge = (status: RequestStatus): Html => html`<span class="badge ${BADGE_C
 const money = (minor: number, currency: string): string => `${formatAmount(minor)} ${currency}`;
 const when = (ms: number): string => new Date(ms).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
 
-function requestRow(r: PurchaseRequest): Html {
+const RISK_CLASS: Record<string, string> = { low: 'ok', medium: 'hold', high: 'bad' };
+const riskBadge = (risk: string): Html => html`<span class="badge ${RISK_CLASS[risk] ?? ''}">risk ${risk}</span>`;
+
+/** One chip per reviewer flag, coloured by what the flag does and explained on hover. */
+function flagChips(flags: readonly string[]): Html {
+  return html`${flags.map((f) => {
+    const known = (FLAG_RISK as Record<string, unknown>)[f] !== undefined;
+    const floor = known ? FLAG_RISK[f as ReviewFlag] : null;
+    const cls = floor === 'high' ? 'bad' : floor === 'medium' ? 'hold' : '';
+    return html`<span class="chip ${cls}" title="${known ? FLAG_TEXT[f as ReviewFlag] : ''}">${f}</span>`;
+  })}`;
+}
+
+/** The reviewer's verdict. Compact (queue cards): a low-risk review with no flags is one quiet line, the detail page has the rest. */
+function reviewBlock(decision: Decision, opts: { compact?: boolean } = {}): Html {
+  if (decision.reviewRisk === null && decision.reviewFlags.length === 0) return html``;
+  if (opts.compact && decision.reviewRisk === 'low' && decision.reviewFlags.length === 0) return html`<div class="muted">AI review: risk low, no flags.</div>`;
+  return html`<div class="review"><strong>AI review</strong> ${decision.reviewRisk === null ? '' : riskBadge(decision.reviewRisk)} ${flagChips(decision.reviewFlags)}
+  ${decision.reviewExplanation ? html`<div class="wrap" style="margin-top:4px">${decision.reviewExplanation}</div>` : ''}</div>`;
+}
+
+interface RequestRowData {
+  request: PurchaseRequest;
+  flags: readonly string[];
+}
+
+function requestRow({ request: r, flags }: RequestRowData): Html {
   return html`<tr>
   <td><a href="/requests/${r.id}" class="mono">${r.id}</a></td>
-  <td>${badge(r.status)}</td>
-  <td class="wrap">${r.merchant}<div class="muted">${r.item}</div></td>
+  <td>${badge(r.status)}${flags.length > 0 ? html`<div>${flagChips(flags)}</div>` : ''}</td>
+  <td class="wrap"><a href="/requests/${r.id}">${r.merchant}</a><div class="muted">${r.item}</div></td>
   <td>${money(r.amountMinor, r.currency)}</td>
   <td>${r.agentId}</td>
   <td class="muted">${when(r.createdAt)}</td>
 </tr>`;
 }
 
-function requestTable(rows: PurchaseRequest[], empty: string): Html {
+function requestTable(rows: RequestRowData[], empty: string): Html {
   if (rows.length === 0) return html`<p class="muted">${empty}</p>`;
-  return html`<table>
+  return html`<table class="requests">
 <thead><tr><th>Request</th><th>Status</th><th>Merchant / item</th><th>Amount</th><th>Agent</th><th>Created</th></tr></thead>
 <tbody>${rows.map(requestRow)}</tbody>
 </table>`;
@@ -246,11 +296,7 @@ function decisionBlock(decision: Decision | undefined): Html {
   if (!decision) return html`<p class="muted">No decision yet.</p>`;
   return html`<p>Policy said <strong>${decision.policyVerdict}</strong>; final decision <strong>${decision.finalDecision}</strong> (by ${decision.decidedBy}).</p>
 ${decision.policyReasons.map((r) => html`<div class="reason"><strong>${r.code}</strong> ${r.message}</div>`)}
-${
-  decision.reviewRisk === null && decision.reviewFlags.length === 0
-    ? ''
-    : html`<p>AI review: risk <strong>${decision.reviewRisk ?? 'n/a'}</strong>${decision.reviewFlags.length > 0 ? html`, flags ${decision.reviewFlags.join(', ')}` : ''}.<br><span class="muted">${decision.reviewExplanation ?? ''}</span></p>`
-}`;
+${reviewBlock(decision)}`;
 }
 
 function paymentBlock(payment: Payment | undefined): Html {
@@ -322,6 +368,7 @@ export function createApp(deps: AppDeps): Hono {
     const body = html`<h1>Overview</h1>
 ${executor ? '' : html`<div class="notice">Keyless mode: requests are decided but nothing is charged (no PayPal sandbox credentials in .env).</div>`}
 ${mandate ? '' : html`<div class="error">PayPal is not linked yet: approved requests cannot be charged. <a href="/paypal">Link PayPal (sandbox)</a></div>`}
+${deps.reviewer ? html`<div class="notice">AI reviewer: <strong>${deps.reviewer.label}</strong>${deps.reviewer.mock ? ' — set LLM_PROVIDER=anthropic and LLM_API_KEY in .env for a real model.' : ''} It can only tighten decisions; a failure means HOLD.</div>` : ''}
 <div class="grid">
 ${agents.map((a) => {
   const policy = repo.getPolicy(a.id);
@@ -344,7 +391,8 @@ ${held.map((r) => {
   <div class="wrap">${r.item}</div>
   <div class="muted wrap">Agent's reason: “${r.reason}”</div>
   ${(decision?.policyReasons ?? []).map((reason) => html`<div class="reason"><strong>${reason.code}</strong> ${reason.message}</div>`)}
-  <div class="actions" style="margin-top:8px">
+  ${decision ? reviewBlock(decision, { compact: true }) : ''}
+  <div class="actions decide" style="margin-top:8px">
     <form method="post" action="/requests/${r.id}/approve"><button type="submit">Approve &amp; pay</button></form>
     <form method="post" action="/requests/${r.id}/deny"><button type="submit" class="deny">Deny</button></form>
     <a class="btn ghost" href="/requests/${r.id}">Details</a>
@@ -352,7 +400,10 @@ ${held.map((r) => {
 </div>`;
 })}
 <h2>Recent requests</h2>
-${requestTable(recent, 'No requests yet. Run the demo agent.')}`;
+${requestTable(
+  recent.map((request) => ({ request, flags: repo.latestDecision(request.id)?.reviewFlags ?? [] })),
+  'No requests yet. Run the demo agent.',
+)}`;
     return c.html(page('Overview', body));
   });
 
@@ -378,7 +429,7 @@ ${notice ? html`<div class="notice">${notice}</div>` : ''}
 <tr><th>Created</th><td>${when(request.createdAt)}</td></tr>
 </table>
 </div>
-<div class="actions">
+<div class="actions decide">
 ${request.status === 'HELD' ? html`<form method="post" action="/requests/${request.id}/approve"><button type="submit">Approve &amp; pay</button></form><form method="post" action="/requests/${request.id}/deny"><input type="hidden" name="note" value=""><button type="submit" class="deny">Deny</button></form>` : ''}
 ${request.status === 'PAID' && executor ? html`<form method="post" action="/requests/${request.id}/refund"><button type="submit" class="ghost">Refund</button></form>` : ''}
 </div>

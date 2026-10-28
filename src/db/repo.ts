@@ -71,6 +71,10 @@ export interface NewAuditEntry {
 
 export interface RequestFilter {
   agentId?: string;
+  /** Normalized merchant name, as stored in merchant_key. */
+  merchantKey?: string;
+  /** Any of these statuses; combined with `status` by AND if both are given. */
+  statuses?: readonly RequestStatus[];
   status?: RequestStatus;
   limit?: number;
 }
@@ -258,6 +262,15 @@ export class Repo {
     if (filter.status !== undefined) {
       where.push('status = ?');
       params.push(filter.status);
+    }
+    if (filter.merchantKey !== undefined) {
+      where.push('merchant_key = ?');
+      params.push(filter.merchantKey);
+    }
+    if (filter.statuses !== undefined) {
+      if (filter.statuses.length === 0) return [];
+      where.push(`status IN (${filter.statuses.map(() => '?').join(', ')})`);
+      params.push(...filter.statuses);
     }
     params.push(filter.limit ?? 100);
     const sql = `SELECT * FROM requests ${where.length > 0 ? `WHERE ${where.join(' AND ')}` : ''} ORDER BY created_at DESC, id DESC LIMIT ?`;

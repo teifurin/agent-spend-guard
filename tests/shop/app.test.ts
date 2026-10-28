@@ -1,17 +1,27 @@
 import { describe, expect, it } from 'vitest';
 import { createShopApp } from '../../src/shop/app.js';
-import { MALICIOUS_SLUG, PRODUCTS, productBySlug } from '../../src/shop/catalog.js';
+import { MALICIOUS_SLUG, MARKED_UP_SLUG, PRODUCTS, productBySlug } from '../../src/shop/catalog.js';
 
 const app = createShopApp();
 
 describe('synthetic shop', () => {
-  it('lists four synthetic products and says so on every page', async () => {
+  it('lists five synthetic products and says so on every page', async () => {
     const res = await app.request('/');
     expect(res.status).toBe(200);
     const body = await res.text();
     expect(body).toContain('Synthetic demo data');
+    expect(PRODUCTS.length).toBe(5);
     for (const p of PRODUCTS) expect(body).toContain(`/products/${p.slug}`);
     expect(PRODUCTS.filter((p) => p.hiddenText).length).toBe(1);
+  });
+
+  it('relists the notebook at a marked-up price under the same merchant and name', () => {
+    const original = productBySlug('field-notebook-a5');
+    const markedUp = productBySlug(MARKED_UP_SLUG);
+    expect(markedUp?.merchant).toBe(original?.merchant);
+    expect(markedUp?.name).toBe(original?.name);
+    expect(markedUp?.priceMinor).toBeGreaterThan((original?.priceMinor ?? 0) * 2);
+    expect(markedUp?.hiddenText).toBeUndefined();
   });
 
   it('serves product pages without scripts and with a strict CSP', async () => {

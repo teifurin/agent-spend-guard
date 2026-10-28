@@ -1,7 +1,7 @@
 /**
  * `npm run dev`: starts the guard server (dashboard, agent API, SSE) and the synthetic shop on its own port.
  * Without PayPal credentials it runs keyless: requests are decided, nothing is charged, linking is disabled.
- * With PAYPAL_ENV set to anything but SANDBOX it refuses to start.
+ * With PAYPAL_ENV set to anything but SANDBOX it refuses to start, and so it does with LLM_PROVIDER=anthropic but no key.
  */
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
@@ -14,6 +14,7 @@ import { PayPalExecutor } from '../guard/executor.js';
 import { Guard } from '../guard/pipeline.js';
 import { PayPalClient } from '../paypal/client.js';
 import { loadPayPalConfig, SandboxOnlyError } from '../paypal/env.js';
+import { createReviewer, loadReviewConfig, ReviewConfigError } from '../review/index.js';
 import { createShopApp } from '../shop/app.js';
 import { createApp } from './app.js';
 import { EventBus } from './events.js';
@@ -51,11 +52,29 @@ if ((env.PAYPAL_ENV ?? '').trim() === '' && (env.PAYPAL_CLIENT_ID ?? '').trim() 
   }
 }
 
+let review: ReturnType<typeof createReviewer> | undefined;
+let reviewTimeoutMs = 8_000;
 if (process.exitCode !== 1) {
+  try {
+    const config = loadReviewConfig(env, { shopUrl });
+    review = createReviewer(config, { repo, log: (line) => console.log(`reviewer: ${line}`) });
+    reviewTimeoutMs = config.timeoutMs;
+    console.log(`AI reviewer: ${review.label}${review.mock ? '' : ' (key present, value never printed)'}; product pages fetched only from ${config.pageOrigins.join(', ') || 'nowhere'}`);
+  } catch (err) {
+    if (err instanceof ReviewConfigError) {
+      console.error(`refusing to start: ${err.message}`);
+      process.exitCode = 1;
+    } else {
+      throw err;
+    }
+  }
+}
+
+if (process.exitCode !== 1 && review) {
   const events = new EventBus();
   const executor = paypal ? new PayPalExecutor({ client: paypal, repo, log: (line) => console.log(`executor: ${line}`) }) : undefined;
-  const guard = new Guard({ repo, executor });
-  const app = createApp({ repo, guard, events, executor, paypal, publicBaseUrl, shopUrl });
+  const guard = new Guard({ repo, executor, reviewer: review.reviewer, reviewTimeoutMs });
+  const app = createApp({ repo, guard, events, executor, paypal, publicBaseUrl, shopUrl, reviewer: { label: review.label, mock: review.mock } });
   const shop = createShopApp();
 
   serve({ fetch: app.fetch, port, hostname: host }, (info) => {

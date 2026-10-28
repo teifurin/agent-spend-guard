@@ -48,7 +48,7 @@ export function createShopApp(): Hono {
       layout(
         'Products',
         html`<h1>Synthetic Shop</h1>
-<p>Four products from four made-up merchants. One of these pages is hostile on purpose.</p>
+<p>Five products from four made-up merchants. One page is hostile on purpose; one relists a product at a surprising price.</p>
 ${PRODUCTS.map(
   (p) => html`<div class="card">
   <div class="merchant">${p.merchant}</div>

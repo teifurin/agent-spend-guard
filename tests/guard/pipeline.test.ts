@@ -101,6 +101,17 @@ describe('Guard.submit', () => {
     expect(result.decision).toMatchObject({ policyVerdict: 'ALLOW', finalDecision: 'HOLD', decidedBy: 'reviewer', reviewRisk: 'high', reviewFlags: ['PROMPT_INJECTION'] });
   });
 
+  it('lets the reviewer block an allowed request, and nothing is charged', async () => {
+    const reviewer: Reviewer = async () => ({ risk: 'high', flags: ['PROMPT_INJECTION_SUSPECTED'], explanation: 'the page orders the agent around', recommendation: 'BLOCK' });
+    const { charge, executor } = fakeExecutor();
+    const { guard } = setup({ reviewer, executor });
+    const result = await guard.submit(ok);
+    expect(result.request.status).toBe('BLOCKED');
+    expect(result.decision).toMatchObject({ policyVerdict: 'ALLOW', finalDecision: 'BLOCK', decidedBy: 'reviewer' });
+    expect(result.payment).toBeNull();
+    expect(charge).not.toHaveBeenCalled();
+  });
+
   it('never lets the reviewer loosen a hold', async () => {
     const reviewer: Reviewer = async () => ({ risk: 'low', flags: [], explanation: 'looks fine to me', recommendation: 'AUTO_APPROVE' });
     const { guard } = setup({ reviewer });

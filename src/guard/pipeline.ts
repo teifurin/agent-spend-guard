@@ -11,6 +11,7 @@ import type { NewRequest, Repo } from '../db/repo.js';
 import type { Decision, FinalDecision, Payment, Policy, PolicyReason, PurchaseRequest, RequestStatus, ReviewRisk } from '../domain/types.js';
 import { type BudgetSnapshot, evaluatePolicy, type PolicyResult } from '../policy/engine.js';
 import type { PolicyVerdict } from '../policy/reasons.js';
+import { clampText } from '../review/text.js';
 import type { PayPalExecutor } from './executor.js';
 
 export interface ReviewInput {
@@ -114,7 +115,8 @@ export class Guard {
         review = await this.runReviewer({ request, policy, policyVerdict: policyResult.verdict, policyReasons: policyResult.reasons, budget: policyResult.budget });
         final = tighter(policyFinal, review.recommendation);
       } catch (err) {
-        reviewFailure = err instanceof Error ? err.message : String(err);
+        // Short and secret-free: this text reaches the dashboard, the audit log and the agent.
+        reviewFailure = clampText(err instanceof Error ? err.message : String(err), 300);
         final = tighter(policyFinal, 'HOLD');
       }
     }

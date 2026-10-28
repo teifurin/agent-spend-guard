@@ -2,9 +2,12 @@
  * The demo shopping agent (mock mode): browses the synthetic shop over HTTP and asks the guard to pay through the
  * MCP server, which it starts as a child process over stdio, exactly as an LLM-driven agent would.
  *
- *   npm run demo:agent                      # all three scenarios
- *   npm run demo:agent -- --scenario 2      # one scenario: 1 notebook, 2 microscope, 3 pens (the hostile page)
+ *   npm run demo:agent                      # all four scenarios, in order
+ *   npm run demo:agent -- --scenario 2      # one: 1 notebook, 2 microscope, 3 pens (the hostile page), 4 the notebook at 2.4x the price
  *   npm run demo:agent -- --wait 180        # how long to wait for the owner on a held request (seconds, 0 = don't)
+ *
+ * Scenario 4 only shows the price check when scenario 1 ran before it (in this database): the reviewer compares
+ * with earlier accepted purchases of the same item. On a fresh database it is just a notebook inside the rules.
  *
  * Needs `npm run dev` running. Reads SHOP_URL, GUARD_URL and AGENT_ID from the environment (not from .env: this
  * process and the MCP server it spawns never see PayPal credentials).
@@ -27,7 +30,8 @@ interface Scenario {
 const SCENARIOS: Scenario[] = [
   { n: 1, title: 'A notebook inside the rules', slug: 'field-notebook-a5', expect: 'auto-approved and paid' },
   { n: 2, title: 'A microscope at a merchant the owner never allowed', slug: 'usb-microscope', expect: 'held for the owner' },
-  { n: 3, title: 'A bargain page that secretly tells the agent what to do', slug: 'premium-pens-set', expect: 'held (M2) or blocked by the AI reviewer (M3)' },
+  { n: 3, title: 'A bargain page that secretly tells the agent what to do', slug: 'premium-pens-set', expect: 'blocked by the AI reviewer: prompt injection' },
+  { n: 4, title: 'The same notebook, suddenly at 2.4x the price', slug: 'field-notebook-a5-marked-up', expect: 'inside the rules, but held by the AI reviewer: price anomaly (needs scenario 1 in the history)' },
 ];
 
 interface ToolResult {
@@ -65,10 +69,11 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 
 function describe(result: Record<string, unknown> | undefined): string {
   if (!result) return 'no structured result';
-  const decision = result['decision'] as { final?: string; reasons?: Array<{ code: string; message: string }> } | null;
+  const decision = result['decision'] as { final?: string; decided_by?: string; reasons?: Array<{ code: string; message: string }>; review?: { risk?: string | null; flags?: string[]; explanation?: string | null } | null } | null;
   const payment = result['payment'] as { status?: string; paypal_capture_id?: string | null } | null;
-  const parts = [`request ${String(result['request_id'])} is ${String(result['status'])}`];
-  if (decision?.reasons && decision.reasons.length > 0) parts.push(`reasons: ${decision.reasons.map((r) => `${r.code} (${r.message})`).join('; ')}`);
+  const parts = [`request ${String(result['request_id'])} is ${String(result['status'])}${decision?.decided_by ? ` (decided by ${decision.decided_by})` : ''}`];
+  if (decision?.reasons && decision.reasons.length > 0) parts.push(`rules: ${decision.reasons.map((r) => `${r.code} (${r.message})`).join('; ')}`);
+  if (decision?.review) parts.push(`AI review: risk ${decision.review.risk ?? 'n/a'}${decision.review.flags && decision.review.flags.length > 0 ? `, flags ${decision.review.flags.join(', ')}` : ''}${decision.review.explanation ? ` — ${decision.review.explanation}` : ''}`);
   if (payment?.paypal_capture_id) parts.push(`PayPal capture ${payment.paypal_capture_id}`);
   return parts.join(' | ');
 }
@@ -136,6 +141,7 @@ async function main(): Promise<void> {
     let view = result.structuredContent;
     guardSays(describe(view));
     guardSays(String(view?.['message'] ?? ''));
+    if (view?.['status'] === 'BLOCKED') say('blocked, so I stop here; the guard told me not to retry.');
 
     if (view?.['status'] === 'HELD' && args.waitSeconds > 0) {
       const requestId = String(view['request_id']);

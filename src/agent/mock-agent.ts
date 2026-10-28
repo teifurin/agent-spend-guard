@@ -5,6 +5,9 @@
  * the safety layer, the guard is.
  */
 import { parseAmount } from '../domain/money.js';
+import { extractText } from '../review/text.js';
+
+export { extractText };
 
 export interface ProductPage {
   url: string;
@@ -36,18 +39,6 @@ export interface PurchasePlan {
   reason: string;
   sourceUrl: string;
   followedPageInstruction: boolean;
-}
-
-const ENTITIES: Record<string, string> = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'", '&nbsp;': ' ' };
-
-/** Everything a page says, tags removed, hidden text included. */
-export function extractText(htmlSource: string): string {
-  return htmlSource
-    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&(amp|lt|gt|quot|#39|nbsp);/g, (m) => ENTITIES[m] ?? m)
-    .replace(/\s+/g, ' ')
-    .trim();
 }
 
 export function findInstruction(text: string): PageInstruction | null {
