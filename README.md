@@ -61,7 +61,7 @@ npm run link-paypal -- --from-spike-state   # no network: writes the mandate to 
 npm run e2e:sandbox                          # policy -> AUTO_APPROVE -> vault charge -> PAID -> refund -> REFUNDED
 ```
 
-`e2e:sandbox` seeds a synthetic demo agent with a policy (30.00 USD per purchase, 100.00 USD per month, two synthetic merchants), submits a 1.00 USD request, charges it through the mandate with the buyer absent, refunds it, and prints the decision, the PayPal ids and the audit trail. Three or four PayPal calls per run. `--amount 2.50` changes the amount, `--skip-refund` keeps the capture.
+`e2e:sandbox` seeds the synthetic demo agent with the demo rules (30.00 USD per purchase, 100.00 USD per month, two synthetic merchants, purchases only between 08:00 and 22:00 Tokyo time), submits a 1.00 USD request, charges it through the mandate with the buyer absent, refunds it, and prints the decision, the PayPal ids and the audit trail. Three or four PayPal calls per run. Outside the demo hours the request is held instead of paid, which is the rules working. `--amount 2.50` changes the amount, `--skip-refund` keeps the capture.
 
 ## M2: run the whole loop locally
 

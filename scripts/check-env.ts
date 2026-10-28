@@ -7,7 +7,7 @@ import { loadDotEnv } from '../src/config/env.js';
 loadDotEnv();
 const env = process.env;
 const REQUIRED = ['PAYPAL_CLIENT_ID', 'PAYPAL_CLIENT_SECRET'] as const;
-const OPTIONAL = ['LLM_PROVIDER', 'LLM_API_KEY', 'LLM_MODEL', 'PUBLIC_BASE_URL', 'SPIKE_PORT', 'SPIKE_RETURN_BASE', 'DB_PATH', 'PORT', 'SHOP_PORT', 'SHOP_URL', 'GUARD_URL', 'AGENT_ID'] as const;
+const OPTIONAL = ['LLM_PROVIDER', 'LLM_API_KEY', 'LLM_MODEL', 'PUBLIC_BASE_URL', 'SPIKE_PORT', 'SPIKE_RETURN_BASE', 'DB_PATH', 'HOST', 'PORT', 'SHOP_PORT', 'SHOP_URL', 'GUARD_URL', 'AGENT_ID'] as const;
 
 let ready = true;
 const isSet = (key: string): boolean => (env[key] ?? '').trim() !== '';

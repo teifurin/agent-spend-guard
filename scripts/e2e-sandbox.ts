@@ -88,7 +88,7 @@ async function main(): Promise<void> {
     console.log(`     budget ${result.policy.budget.monthKey}: spent ${formatAmount(result.policy.budget.spentMinor)} of ${formatAmount(result.policy.budget.capMinor)} USD before this request`);
   }
   if (result.decision.finalDecision !== 'AUTO_APPROVE') {
-    console.error(`[fail] expected AUTO_APPROVE. The request is ${result.request.status}; adjust the amount or wait for the budget month to roll over.`);
+    console.error(`[fail] expected AUTO_APPROVE. The request is ${result.request.status}. The demo rules allow purchases only between 08:00 and 22:00 Asia/Tokyo and up to 100.00 USD a month; run it inside those hours, or wait for the budget month to roll over.`);
     printAudit(repo, result.request.id);
     process.exitCode = 1;
     return;
