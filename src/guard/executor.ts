@@ -57,6 +57,7 @@ export class PayPalExecutor {
       throw new ExecutorError(`request "${requestId}" is ${request.status}; only AUTO_APPROVED or APPROVED requests can be charged`);
     }
 
+    const resumed = this.repo.paymentForRequest(requestId) !== undefined;
     let payment = this.repo.beginPayment(requestId);
     if (payment.status !== 'CREATED') return payment;
 
@@ -68,7 +69,7 @@ export class PayPalExecutor {
     }
     // The vault id must never reach a log or an error message, even if PayPal echoes the request body back.
     this.client.redactor.add(mandate.paypalVaultId);
-    if (!payment.paypalOrderId) {
+    if (!resumed) {
       this.audit('payment.started', request.id, request.agentId, { paymentId: payment.id, mandateId: mandate.id, amountMinor: request.amountMinor, currency: request.currency });
     }
 
