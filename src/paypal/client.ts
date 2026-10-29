@@ -82,14 +82,17 @@ export class PayPalClient {
         'Content-Type': 'application/x-www-form-urlencoded',
         Accept: 'application/json',
       },
-      body: 'grant_type=client_credentials',
+      // ignoreCache=true asks PayPal for a newly minted token rather than the one it cached for this client. The cached
+      // token keeps the permissions the app had when it was minted (up to nine hours), so a feature switched on
+      // afterwards, such as "Save payment methods" (Vault), would otherwise stay invisible until it expires.
+      body: 'grant_type=client_credentials&ignoreCache=true',
     });
     const text = await res.text();
     if (!res.ok) throw this.toError(res.status, text);
-    const json = JSON.parse(text) as { access_token: string; expires_in: number };
+    const json = JSON.parse(text) as { access_token: string; expires_in: number; scope?: string };
     this.token = { value: json.access_token, expiresAt: this.now() + json.expires_in * 1000 };
     this.redactor.add(json.access_token);
-    this.log(`POST /v1/oauth2/token -> ${res.status} (token expires in ${json.expires_in}s)`);
+    this.log(`POST /v1/oauth2/token -> ${res.status} (token expires in ${json.expires_in}s${describeVaultScope(json.scope)})`);
     return json.access_token;
   }
 
@@ -152,6 +155,15 @@ function parseJsonObject(text: string): Record<string, unknown> | undefined {
 
 function str(v: unknown): string | undefined {
   return typeof v === 'string' ? v : undefined;
+}
+
+/**
+ * Whether the token carries the vault permission, which the sandbox app grants under "Save payment methods". PayPal
+ * lists the granted permissions as scope URIs; the fake and the tests may omit the field.
+ */
+function describeVaultScope(scope: string | undefined): string {
+  if (typeof scope !== 'string') return '';
+  return scope.includes('vault') ? '; vault scope: yes' : '; vault scope: NO, enable "Save payment methods" on the sandbox app and restart';
 }
 
 /**

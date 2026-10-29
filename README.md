@@ -47,7 +47,7 @@ With your own sandbox account: M0 (the spike) and M1 (`e2e:sandbox`, the same fo
 
 Prerequisites: Node 22.13 or newer and a free [PayPal developer](https://developer.paypal.com/) account.
 
-1. In the Developer Dashboard create a **sandbox** REST app. Under *Sandbox App Settings* enable **Accept payments**, then open *Advanced options* and tick **Vault**. Note the client id and secret.
+1. In the Developer Dashboard create a **sandbox** REST app of type Merchant on a **US** business sandbox account (a business account in another currency can refuse refunds with `REFUND_FAILED_INSUFFICIENT_FUNDS`). Tick **Save payment methods** under *Payment capabilities* (older dashboards: *Advanced options → Vault*) and save; note the client id and secret. If a link still fails with `403 NOT_AUTHORIZED`, read the token line in the server log: `vault scope: NO` means the permission is not on the app yet. The client asks PayPal for a freshly minted token (`ignoreCache=true`) because PayPal otherwise hands back the token it cached, with the permissions of that moment, for up to nine hours.
 2. Find the auto-generated **personal** (buyer) sandbox account under *Testing Tools → Sandbox Accounts*. You will log in with it on PayPal's approval page.
 3. Configure and verify:
 

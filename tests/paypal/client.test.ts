@@ -54,7 +54,7 @@ describe('PayPalClient', () => {
 
     const [tokenCall, orderCall] = calls;
     expect(tokenCall && headerOf(tokenCall, 'Authorization')).toBe(`Basic ${Buffer.from(`${CLIENT_ID}:${SECRET}`).toString('base64')}`);
-    expect(tokenCall?.init.body).toBe('grant_type=client_credentials');
+    expect(tokenCall?.init.body).toBe('grant_type=client_credentials&ignoreCache=true');
     expect(orderCall && headerOf(orderCall, 'Authorization')).toBe(`Bearer ${TOKEN}`);
     expect(orderCall && headerOf(orderCall, 'PayPal-Request-Id')).toBe('asg-order-test');
     expect(orderCall && headerOf(orderCall, 'Prefer')).toBe('return=representation');
@@ -73,6 +73,22 @@ describe('PayPalClient', () => {
     now += 3600 * 1000 - 30_000; // 30 s before expiry: inside the refresh margin
     await client.request('GET', '/v2/checkout/orders/C');
     expect(calls.filter(isTokenCall).length).toBe(2);
+  });
+
+  it('logs whether the token carries the vault permission, never the token itself', async () => {
+    const lineFor = async (scope: string | undefined): Promise<string> => {
+      const lines: string[] = [];
+      const body = { access_token: TOKEN, expires_in: 32400, token_type: 'Bearer', ...(scope === undefined ? {} : { scope }) };
+      const { fetch } = makeFetch((c) => (isTokenCall(c) ? json(body) : json({ ok: true })));
+      await new PayPalClient(cfg, { fetch, log: (l) => lines.push(l) }).request('GET', '/v2/checkout/orders/A');
+      const line = lines.find((l) => l.includes('/v1/oauth2/token'));
+      expect(line).toBeDefined();
+      expect(line).not.toContain(TOKEN);
+      return line ?? '';
+    };
+    expect(await lineFor('https://uri.paypal.com/services/payments/payment https://uri.paypal.com/services/vault/payment-tokens/readwrite')).toContain('vault scope: yes');
+    expect(await lineFor('https://uri.paypal.com/services/payments/payment')).toContain('vault scope: NO');
+    expect(await lineFor(undefined)).not.toContain('vault scope');
   });
 
   it('retries once with a fresh token when PayPal answers 401', async () => {
