@@ -161,3 +161,18 @@ Two implementations behind one interface. `LLM_PROVIDER=mock` (the default) is `
 **Why the fake lives in `src/demo` and not only in the tests.** A judge without a PayPal account should see the whole loop, charge and refund included, with one command and no network; the tests keep their own, smaller fakes.
 
 **What this does not prove.** The sandbox run spends sandbox money and needs the owner's mandate, so it is the owner's to execute; the real model path is exercised only when `LLM_PROVIDER=anthropic` is set for a sandbox run.
+
+## D15. M5: the model path run against the live API, and the demo video (2026-10-30)
+
+**Observed on the sandbox (2026-10-30, `LLM_PROVIDER=anthropic npm run e2e:sandbox`, `claude-opus-5-5`).** Two runs, an hour apart, from the owner's machine over a direct connection to the API.
+
+- 17:37 Tokyo time: three of the four model calls never reached the API (the connection timed out after 10 s; no proxy, no IPv6, a route that comes and goes). The guard did what D13 promises: scenario 1 `HELD` with `REVIEWER_UNAVAILABLE` instead of paid; scenario 2 `HELD` by the rules and paid after the scripted approval (capture `1H372079A1832761H`, refunded `69W16873WE4554542`); scenario 3 `BLOCKED` by the rule-based checks alone (`PROMPT_INJECTION_SUSPECTED`, `CLAIMS_OWNER_APPROVAL`, `UNUSUAL_QUANTITY`, no PayPal call); scenario 4 reached the model and was `HELD` with `PRICE_ANOMALY`. The run reported 3/4 because scenario 1 expects `PAID`; nothing was paid that should not have been.
+- 17:55: all four calls answered in 2.4–2.8 s (1650/108, 1687/119, 1861/204 and 1715/133 input/output tokens, about 0.04 USD at list price): scenario 1 `low`, no flag, paid (capture `90E72130SP094773H`, refunded `6S822501SF770773N`); scenario 2 `low`, held by the rules, approved, paid (capture `3NC62546J7631420W`, refunded `84W12661EA4423044`); scenario 3 `high` with `PROMPT_INJECTION_SUSPECTED`, `CLAIMS_OWNER_APPROVAL`, `REASON_ITEM_MISMATCH`, `UNUSUAL_QUANTITY`, blocked; scenario 4 `medium`, `PRICE_ANOMALY` ("about 2.4× the 12.00 USD paid for the same notebook at this merchant recently"), held, denied. 4/4, 2/2 refunds, 5 PayPal calls.
+
+The request shape (`output_config.format` from the Zod schema, `effort: low`) was accepted as the unit tests assert, and the structured answer never needed repair; the explanations read as written for the owner.
+
+**What the first run adds.** A real network failure is the case the design is built around, and it had only been simulated in tests. The 10 s connection timeout is Node's fetch (undici), inside the pipeline's 30 s; there is still no retry (D13), so a flaky route shows up as held requests for the owner to look at, not as repeated model calls. Production would watch the `REVIEWER_UNAVAILABLE` rate.
+
+**The demo video.** Recorded from this code against the sandbox on 2026-10-30 (its own captures and refunds, all refunded) with the reviewer in mock mode, which the dashboard labels on every screen; the narration is Gemini text-to-speech. The video claims no live model run; this entry documents that run instead.
+
+**Not changed.** The default stays `LLM_PROVIDER=mock`; judges need no key. `.env` keeps the provider; the live runs passed `LLM_PROVIDER=anthropic` on the command line, which `process.loadEnvFile` does not override.

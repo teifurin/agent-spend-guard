@@ -2,7 +2,7 @@
 
 **A payment guardrail between AI agents and PayPal.** Agents never get a wallet, a card or an API key. They get one tool, `request_purchase`. The guard checks each request against the owner's rules, has an AI reviewer look for anything fishy, and only then charges PayPal. Anything outside the rules waits for a human tap. Everything is logged, and anything can be refunded with one click.
 
-> Status: **M0–M4** done (2026-10-28). Policy engine, decision pipeline and PayPal executor ([D11](docs/DECISIONS.md)); MCP server, mock shopping agent, synthetic shop and owner dashboard with live updates ([D12](docs/DECISIONS.md)); the AI risk reviewer with a mock mode and an Anthropic mode, the injected request ending in BLOCK, price anomalies, a phone-sized dashboard ([D13](docs/DECISIONS.md)); one end-to-end run that plays all four scenarios on the sandbox or, without an account, against a fake PayPal, reproduced from a fresh clone, CI on Node 22 and 24 ([D14](docs/DECISIONS.md)). The whole loop has run against the sandbox: a request auto-paid through the mandate, a held one approved and paid from the dashboard, an injected one stopped. Next: the demo video and the Devpost submission. PayPal AI Hackathon 2026 entry.
+> Status: **M0–M4** done (2026-10-28), **M5** in progress. Policy engine, decision pipeline and PayPal executor ([D11](docs/DECISIONS.md)); MCP server, mock shopping agent, synthetic shop and owner dashboard with live updates ([D12](docs/DECISIONS.md)); the AI risk reviewer with a mock mode and an Anthropic mode, the injected request ending in BLOCK, price anomalies, a phone-sized dashboard ([D13](docs/DECISIONS.md)); one end-to-end run that plays all four scenarios on the sandbox or, without an account, against a fake PayPal, reproduced from a fresh clone, CI on Node 22 and 24 ([D14](docs/DECISIONS.md)). The whole loop has run against the sandbox: a request auto-paid through the mandate, a held one approved and paid from the dashboard, an injected one stopped. M5 (2026-10-30): the demo video is recorded, and the Anthropic reviewer has been run against the live API on the sandbox end-to-end run, 4/4 ([D15](docs/DECISIONS.md)). Next: the Devpost submission. PayPal AI Hackathon 2026 entry.
 > Runs against the PayPal **sandbox only**. Every merchant, product and price in the demo is **synthetic**.
 
 ## The problem
@@ -34,7 +34,7 @@ Without a PayPal account, which is also what CI runs (Node 22.13 or newer):
 
 ```bash
 npm ci
-npm test               # 23 files, 232 tests; PayPal and the model are fakes, no network
+npm test               # 23 files, 233 tests; PayPal and the model are fakes, no network
 npm run e2e:offline    # the four scenarios, charge and refund included, against a fake PayPal
                        # ends with: VERDICT: 4/4 scenarios as expected, 2/2 refunds completed.
 npm run dev            # dashboard on http://localhost:3000, keyless: decisions only, nothing charged
@@ -76,7 +76,7 @@ npm run link-paypal -- --from-spike-state   # no network: writes the mandate to 
 npm run e2e:sandbox                          # four scenarios, the owner's part scripted, both captures refunded
 ```
 
-`e2e:sandbox` runs in a fresh, gitignored database (`.tmp-e2e/`), copies the active mandate from `data/guard.db` into it, seeds the demo rules (30.00 USD per purchase, 100.00 USD per month, two synthetic merchants, purchases only between 08:00 and 22:00 Tokyo time) and plays the scenarios of the table in M2 with the owner scripted: the notebook is paid through the mandate with the buyer absent; the microscope is held, approved and paid; the hostile pens page is blocked with no PayPal call (the run counts them); the repriced notebook is held by the reviewer and denied; then both captures are refunded. Five to seven PayPal calls, 57.00 USD charged and refunded, every id printed, no credential. It refuses to start outside the demo hours, because scenario 1 would be held instead of paid, which is the rules working. `--skip-refund` keeps the captures; `--mandate-from` and `--db` pick other databases. With `LLM_PROVIDER=anthropic` in `.env` the same run uses the real reviewer: one model call per request, four in all. `npm run e2e:offline` is the same run with a fake PayPal, the mock reviewer and a pinned clock, for machines without an account.
+`e2e:sandbox` runs in a fresh, gitignored database (`.tmp-e2e/`), copies the active mandate from `data/guard.db` into it, seeds the demo rules (30.00 USD per purchase, 100.00 USD per month, two synthetic merchants, purchases only between 08:00 and 22:00 Tokyo time) and plays the scenarios of the table in M2 with the owner scripted: the notebook is paid through the mandate with the buyer absent; the microscope is held, approved and paid; the hostile pens page is blocked with no PayPal call (the run counts them); the repriced notebook is held by the reviewer and denied; then both captures are refunded. Five to seven PayPal calls, 57.00 USD charged and refunded, every id printed, no credential. It refuses to start outside the demo hours, because scenario 1 would be held instead of paid, which is the rules working. `--skip-refund` keeps the captures; `--mandate-from` and `--db` pick other databases. With `LLM_PROVIDER=anthropic` in `.env` (or on the command line, which overrides `.env`) the same run uses the real reviewer: one model call per request, four in all. Done on 2026-10-30 with `claude-opus-5-5`: 4/4 scenarios, 2/2 refunds, four model calls of 1.6–1.9k input and 100–200 output tokens, 2.4–2.8 s each, about 0.04 USD at list price. An attempt an hour earlier lost three of the four connections to the API on a flaky route: those three requests were held or blocked (scenario 3 still blocked, by the rule-based checks alone) and nothing was paid, which is the fail-closed path exercised for real ([D15](docs/DECISIONS.md)). `npm run e2e:offline` is the same run with a fake PayPal, the mock reviewer and a pinned clock, for machines without an account.
 
 ## M2: run the whole loop locally
 
@@ -114,7 +114,7 @@ The reviewer answers with a risk level and flags from a fixed vocabulary, and **
 | `LLM_PROVIDER` | What reviews | Needs |
 | --- | --- | --- |
 | `mock` (default) | deterministic rules only: instruction-like text on the page or in the request, owner-approval claims in the reason, a 1.5× price band around the history median, unusual quantities. Every explanation says "Mock reviewer (deterministic rules, no model)" and the dashboard shows it. | nothing |
-| `anthropic` | Claude (`claude-opus-5-5`, or `LLM_MODEL`) through the Vercel AI SDK, with a JSON schema for the answer, effort `low`, no retries; its flags are unioned with the rules above, so the rules are the floor. One model call per request, about 2k input tokens, cancelled after `REVIEW_TIMEOUT_MS` (30 s). | `LLM_API_KEY` in `.env`; the server refuses to start without it |
+| `anthropic` | Claude (`claude-opus-5-5`, or `LLM_MODEL`) through the Vercel AI SDK, with a JSON schema for the answer, effort `low`, no retries; its flags are unioned with the rules above, so the rules are the floor. One model call per request, about 2k input tokens, cancelled after `REVIEW_TIMEOUT_MS` (30 s). Verified against the live API on 2026-10-30 (M1, [D15](docs/DECISIONS.md)): the four scenarios ended exactly as in mock mode, with the model's own explanations. | `LLM_API_KEY` in `.env`; the server refuses to start without it |
 
 ```bash
 LLM_PROVIDER=mock npm run dev            # what judges run; the dashboard labels the reviewer "mock"
@@ -158,13 +158,13 @@ docs/      HANDOFF.md (full plan), RESEARCH.md (sources), DECISIONS.md, THREAT_M
 
 How the guard decides and pays is written down in [docs/DECISIONS.md](docs/DECISIONS.md) (D9: HOLD vs BLOCK, D10: budget accounting, D11: the executor, D12: the M2 topology, D13: the reviewer, D14: the end-to-end run).
 
-Coming next: the demo video and the Devpost submission. Not built: an AG Grid audit table (plain HTML for now, see D13), push notifications, webhooks, a real-LLM mode for the shopping agent (the agent is the mock; the reviewer is where the model goes).
+Coming next: the Devpost submission; the demo video (2:40, narrated, the reviewer in mock mode on screen) is recorded. Not built: an AG Grid audit table (plain HTML for now, see D13), push notifications, webhooks, a real-LLM mode for the shopping agent (the agent is the mock; the reviewer is where the model goes).
 
 Note for Node 22.x: the database uses the built-in `node:sqlite`, which prints a one-line `ExperimentalWarning` on 22.x. It is harmless; Node 24 prints nothing.
 
 ## AI tools used
 
-Built with Claude Code (Anthropic) for code, tests and docs, reviewed by a human before merge. The initial research and plan were drafted with Grok. At runtime the AI reviewer is Claude through the Vercel AI SDK when `LLM_PROVIDER=anthropic`; `LLM_PROVIDER=mock` runs the whole demo without any key and says so on every screen.
+Built with Claude Code (Anthropic) for code, tests and docs, reviewed by a human before merge. The initial research and plan were drafted with Grok. At runtime the AI reviewer is Claude through the Vercel AI SDK when `LLM_PROVIDER=anthropic` (verified against the live API on 2026-10-30, see M1); `LLM_PROVIDER=mock` runs the whole demo without any key and says so on every screen. The demo video's narration is Gemini text-to-speech (Google).
 
 ## License
 
