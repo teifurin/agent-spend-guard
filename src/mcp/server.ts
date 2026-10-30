@@ -1,6 +1,8 @@
 /**
  * The MCP server a shopping agent connects to. It holds no PayPal credential, token or database: every tool is a
- * call to the guard's JSON API, and every result is statuses and ids plus a plain-language message.
+ * call to the guard's JSON API, and every result is what that API says about the request (its own fields, status,
+ * reasons, flags, the reviewer's sentence, PayPal object ids) plus a plain-language message; never a credential or
+ * the vault id.
  *
  * Tools: request_purchase, get_request_status, get_budget.
  */

@@ -598,7 +598,7 @@ ${unsettled && executor ? html`<form method="post" action="/requests/${request.i
 
   app.get('/audit', (c) => {
     const entries = repo.listAudit({ limit: 200 });
-    return c.html(page('Audit log', html`<h1>Audit log</h1><p class="muted">Newest first, last 200 entries. Details hold ids and statuses only.</p><div class="card">${auditTable(entries)}</div>`));
+    return c.html(page('Audit log', html`<h1>Audit log</h1><p class="muted">Newest first, last 200 entries. Details hold the guard's and PayPal's ids, statuses, amounts, reasons and your notes; never a token.</p><div class="card">${auditTable(entries)}</div>`));
   });
 
   // -------------------------------------------------------------- policy editor

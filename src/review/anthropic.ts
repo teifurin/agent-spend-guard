@@ -36,7 +36,7 @@ export interface AnthropicReviewerDeps {
   now?: () => number;
 }
 
-/** What the model must answer with. Flags outside the vocabulary are dropped by the schema itself. */
+/** What the model must answer with. A flag outside the vocabulary fails the whole parse (NoObjectGeneratedError), which the caller turns into HOLD: fail closed, not dropped. */
 export const reviewSchema = z.object({
   risk: z.enum(['low', 'medium', 'high']),
   flags: z.array(z.enum(MODEL_FLAGS)),

@@ -30,7 +30,7 @@ export const OWNER_CLAIM_PATTERNS: readonly RegExp[] = [
   /\bowner(?:'s)? (?:approval|authori[sz]ation|permission|consent) (?:was |is |has been |already )?(?:given|granted|obtained|received|secured)\b/i,
 ];
 
-/** Price ratios outside [1/PRICE_RATIO, PRICE_RATIO] of the history median are anomalies. */
+/** A unit price at or beyond PRICE_RATIO times the history median, or at or below 1/PRICE_RATIO of it, is an anomaly (the bounds themselves count). */
 export const PRICE_RATIO = 1.5;
 /** A quantity this large that also exceeds twice the largest earlier quantity is unusual. */
 export const QUANTITY_MIN = 5;
