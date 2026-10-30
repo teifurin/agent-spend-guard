@@ -18,6 +18,9 @@ const NOW = Date.UTC(2026, 9, 28, 3, 0); // 12:00 Asia/Tokyo, inside the demo ho
 
 /** Stands in for the PayPal executor: moves the request through the same Repo state changes, no network. */
 class FakeExecutor {
+  /** When set, refunds wait on it: lets a test hold one owner action while another arrives. */
+  public hold: Promise<void> | null = null;
+  public refundsStarted = 0;
   constructor(
     private readonly repo: Repo,
     public outcome: 'COMPLETED' | 'FAILED' | 'UNSETTLED' = 'COMPLETED',
@@ -33,20 +36,23 @@ class FakeExecutor {
     return this.outcome === 'COMPLETED' ? this.repo.settlePayment(payment.id, { paypalOrderId: 'O-fake', paypalCaptureId: 'C-fake', capturedAt: NOW }) : this.repo.failPayment(payment.id);
   }
   async refund(requestId: string): Promise<Payment> {
+    this.refundsStarted += 1;
+    if (this.hold) await this.hold;
     const payment = this.repo.paymentForRequest(requestId);
     if (!payment) throw new Error('no payment');
     return this.repo.refundPayment(payment.id, 'R-fake');
   }
 }
 
-function setup(opts: { executor?: boolean; paypal?: PayPalClient; outcome?: 'COMPLETED' | 'FAILED' | 'UNSETTLED' } = {}) {
-  const repo = new Repo(openDatabase(), () => NOW);
+function setup(opts: { executor?: boolean; paypal?: PayPalClient; outcome?: 'COMPLETED' | 'FAILED' | 'UNSETTLED'; now?: () => number } = {}) {
+  const now = opts.now ?? (() => NOW);
+  const repo = new Repo(openDatabase(), now);
   seedDemo(repo);
   const events = new EventBus();
   const fake = new FakeExecutor(repo, opts.outcome);
   const executor = opts.executor === false ? undefined : (fake as unknown as PayPalExecutor);
-  const guard = new Guard({ repo, executor, now: () => NOW });
-  const app = createApp({ repo, guard, events, executor, paypal: opts.paypal, publicBaseUrl: 'http://localhost:3000', shopUrl: 'http://localhost:3001', now: () => NOW, heartbeatMs: 20 });
+  const guard = new Guard({ repo, executor, now });
+  const app = createApp({ repo, guard, events, executor, paypal: opts.paypal, publicBaseUrl: 'http://localhost:3000', shopUrl: 'http://localhost:3001', now, heartbeatMs: 20 });
   const published: GuardEvent[] = [];
   events.subscribe((e) => published.push(e));
   return { repo, app, events, published, fake };
@@ -140,6 +146,9 @@ describe('agent API', () => {
     const { app } = setup();
     const paid = (await (await postJson(app, '/api/requests', { ...notebook, amount: 12 })).json()) as ApiRequest;
     expect(paid.status).toBe('PAID');
+    // a number that is not exact to the cent is refused, like the string "12.005", never rounded
+    expect((await postJson(app, '/api/requests', { ...notebook, amount: 12.005 })).status).toBe(400);
+    expect((await postJson(app, '/api/requests', { ...notebook, amount: 12.004 })).status).toBe(400);
     const res = await app.request(`/api/agents/${DEMO_AGENT_ID}/budget`);
     const budget = (await res.json()) as { month: string; spent: string; remaining: string; policy: { max_per_purchase: string; merchant_allowlist: string[] } };
     expect(budget).toMatchObject({ month: '2026-10', spent: '12.00', remaining: '88.00' });
@@ -237,6 +246,23 @@ describe('owner dashboard', () => {
     expect(repo.getRequest(held.request_id)?.status).toBe('DENIED');
     expect(repo.listAudit({ requestId: held.request_id })[0]).toMatchObject({ actor: 'owner', action: 'owner.denied', details: { note: 'not this month' } });
     expect((await postForm(app, `/requests/${held.request_id}/approve`)).status).toBe(409);
+  });
+
+  it('runs one owner action per request at a time', async () => {
+    const { app, repo, fake } = setup();
+    const paid = (await (await postJson(app, '/api/requests', notebook)).json()) as ApiRequest;
+    let release: () => void = () => {};
+    fake.hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const first = postForm(app, `/requests/${paid.request_id}/refund`);
+    await vi.waitFor(() => expect(fake.refundsStarted).toBe(1));
+    const second = await postForm(app, `/requests/${paid.request_id}/refund`);
+    expect(second.status).toBe(409);
+    release();
+    expect((await first).status).toBe(303);
+    expect(repo.getRequest(paid.request_id)?.status).toBe('REFUNDED');
+    expect(fake.refundsStarted).toBe(1); // the second never reached the executor
   });
 
   it('refunds a paid request from its page', async () => {
@@ -443,7 +469,30 @@ describe('PayPal link flow', () => {
     expect(page).toContain('Linked. Active mandate');
     expect(page).not.toContain(VAULT);
     expect(JSON.stringify(repo.listAudit())).not.toContain(VAULT);
+    expect(JSON.stringify(repo.listAudit())).not.toContain('ST1'); // the setup token id is masked in the audit log
     expect((await app.request('/paypal/return?link=stale')).headers.get('location')).toContain('Unknown');
+    expect((await app.request(`/paypal/return?link=${returnUrl.searchParams.get('link')}`)).headers.get('location')).toContain('Unknown'); // one try per attempt
+  });
+
+  it('forgets a link attempt after fifteen minutes, and the oldest ones when too many are open', async () => {
+    let now = NOW;
+    const { calls, client } = fakePayPal();
+    const { app } = setup({ paypal: client, now: () => now });
+    const keyOf = (n: number): string => {
+      const body = JSON.parse(calls[n]?.body ?? '{}') as { payment_source: { paypal: { experience_context: { return_url: string } } } };
+      return new URL(body.payment_source.paypal.experience_context.return_url).searchParams.get('link') ?? '';
+    };
+
+    await postForm(app, '/paypal/link');
+    const stale = keyOf(0);
+    now += 16 * 60_000;
+    expect((await app.request(`/paypal/return?link=${stale}`)).headers.get('location')).toContain('Unknown%20or%20expired');
+
+    for (let i = 0; i < 21; i++) await postForm(app, '/paypal/link');
+    const evicted = keyOf(1); // the first of the twenty-one, pushed out by the last
+    const kept = keyOf(21);
+    expect((await app.request(`/paypal/return?link=${evicted}`)).headers.get('location')).toContain('Unknown%20or%20expired');
+    expect((await app.request(`/paypal/return?link=${kept}`)).headers.get('location')).toContain('Linked');
   });
 
   it('is disabled without PayPal credentials', async () => {

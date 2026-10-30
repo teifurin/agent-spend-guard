@@ -22,7 +22,7 @@ Architecture decision log, oldest first. Each entry says what was decided, why, 
 
 | step | result |
 | --- | --- |
-| `POST /v3/vault/setup-tokens` | 201, `PAYER_ACTION_REQUIRED`, id `56H41380NR184072M` |
+| `POST /v3/vault/setup-tokens` | 201, `PAYER_ACTION_REQUIRED`, id `56H4…` (masked) |
 | owner approval | browser redirect to `127.0.0.1:8787/return`; token `APPROVED` |
 | `POST /v3/vault/payment-tokens` | 201, payment token created (masked `9uc...3j`) |
 | `POST /v2/checkout/orders` with `vault_id`, buyer absent | 201, order `55M30185U89391303` returned **`COMPLETED` on create**, capture `7YX66140XX426782L` (no separate capture call) |

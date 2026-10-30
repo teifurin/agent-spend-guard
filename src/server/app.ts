@@ -4,7 +4,7 @@
  * untrusted text and is only ever interpolated through hono/html, which escapes it.
  */
 import { randomBytes } from 'node:crypto';
-import { Hono } from 'hono';
+import { type Context, Hono } from 'hono';
 import { csrf } from 'hono/csrf';
 import { html, raw } from 'hono/html';
 import { streamSSE } from 'hono/streaming';
@@ -16,6 +16,7 @@ import type { PayPalExecutor } from '../guard/executor.js';
 import type { Guard } from '../guard/pipeline.js';
 import type { PayPalClient } from '../paypal/client.js';
 import { describePayPalError } from '../paypal/errors.js';
+import { mask } from '../paypal/redact.js';
 import { createPaymentToken, createSetupToken, getSetupToken } from '../paypal/vault.js';
 import { monthBounds } from '../policy/time.js';
 import { validatePolicy } from '../policy/validate.js';
@@ -54,7 +55,13 @@ const requestSchema = z.object({
 });
 
 function toMinor(amount: string | number): number | undefined {
-  if (typeof amount === 'number') return Number.isFinite(amount) && amount > 0 ? parseAmount(amount.toFixed(2)) : undefined;
+  if (typeof amount === 'number') {
+    // A number is taken only when it is exact to the cent: 12.005 is refused, as the string "12.005" is, never rounded (D16).
+    if (!Number.isFinite(amount) || amount <= 0) return undefined;
+    const cents = amount * 100;
+    if (Math.abs(cents - Math.round(cents)) > 1e-6) return undefined;
+    return parseAmount(amount.toFixed(2));
+  }
   return parseAmount(amount.trim());
 }
 
@@ -377,8 +384,35 @@ export function createApp(deps: AppDeps): Hono {
   const { repo, guard, events, executor, paypal } = deps;
   const now = deps.now ?? Date.now;
   const page = (title: string, body: unknown, live = true) => layout(title, body, { shopUrl: deps.shopUrl, live });
-  const pendingLinks = new Map<string, { setupTokenId: string; createdAt: number }>();
   const app = new Hono();
+
+  // Link attempts in progress, keyed by the random value in PayPal's return URL. A setup token is approved within
+  // minutes or not at all, so attempts expire, and only a few may be open at once (each one cost a PayPal call) (D16).
+  const pendingLinks = new Map<string, { setupTokenId: string; createdAt: number }>();
+  const LINK_TTL_MS = 15 * 60_000;
+  const LINK_MAX_PENDING = 20;
+  const pruneLinks = (): void => {
+    const cutoff = now() - LINK_TTL_MS;
+    for (const [key, pending] of pendingLinks) if (pending.createdAt < cutoff) pendingLinks.delete(key);
+    while (pendingLinks.size > LINK_MAX_PENDING) {
+      const oldest = pendingLinks.keys().next().value; // insertion order
+      if (oldest === undefined) break;
+      pendingLinks.delete(oldest);
+    }
+  };
+
+  // One owner action per request at a time: a double click or two tabs cannot race two charges or two refunds (D16).
+  const busy = new Set<string>();
+  const withLock = async <T>(id: string, work: () => Promise<T>): Promise<T | undefined> => {
+    if (busy.has(id)) return undefined;
+    busy.add(id);
+    try {
+      return await work();
+    } finally {
+      busy.delete(id);
+    }
+  };
+  const inProgress = (c: Context, id: string) => c.html(page('Busy', html`<h1>Another action on this request is still running</h1><p><a href="/requests/${id}">Back</a></p>`), 409);
 
   // Order matters (D16): the Host check runs before any route (DNS rebinding of a loopback server); hono/csrf then
   // refuses a POST with a form content type unless its Origin or Sec-Fetch-Site says same-origin (JSON from the MCP
@@ -497,7 +531,9 @@ ${unsettled && executor ? html`<form method="post" action="/requests/${request.i
   app.post('/requests/:id/approve', async (c) => {
     const id = c.req.param('id');
     try {
-      const { request, payment } = await guard.approve(id, 'owner');
+      const outcome = await withLock(id, () => guard.approve(id, 'owner'));
+      if (!outcome) return inProgress(c, id);
+      const { request, payment } = outcome;
       publishRequest('owner.approved', request);
       if (payment) publishRequest(paymentEvent(payment), request);
       const notice = !payment
@@ -517,7 +553,8 @@ ${unsettled && executor ? html`<form method="post" action="/requests/${request.i
     const id = c.req.param('id');
     if (!executor) return c.html(page('Error', html`<h1>Retrying a payment needs PayPal credentials</h1>`), 503);
     try {
-      const payment = await guard.retryCharge(id, 'owner');
+      const payment = await withLock(id, () => guard.retryCharge(id, 'owner'));
+      if (!payment) return inProgress(c, id);
       const request = repo.getRequest(id);
       if (request) publishRequest(paymentEvent(payment), request);
       const notice =
@@ -549,7 +586,8 @@ ${unsettled && executor ? html`<form method="post" action="/requests/${request.i
     const id = c.req.param('id');
     if (!executor) return c.html(page('Error', html`<h1>Refunds need PayPal credentials</h1>`), 503);
     try {
-      const payment = await executor.refund(id);
+      const payment = await withLock(id, () => executor.refund(id));
+      if (!payment) return inProgress(c, id);
       const request = repo.getRequest(id);
       if (request) publishRequest('payment.refunded', request);
       return c.redirect(`/requests/${id}?notice=${encodeURIComponent(`Refunded (refund ${payment.paypalRefundId ?? '?'}).`)}`, 303);
@@ -655,6 +693,7 @@ ${mandates.length === 0 ? '' : html`<h2>Mandates</h2><div class="card"><table><t
     if (!paypal) return c.html(page('PayPal', paypalPage(undefined, 'Linking needs PayPal sandbox credentials in .env.')), 503);
     const key = randomBytes(8).toString('hex');
     try {
+      pruneLinks();
       const setup = await createSetupToken(paypal, {
         returnUrl: `${deps.publicBaseUrl}/paypal/return?link=${key}`,
         cancelUrl: `${deps.publicBaseUrl}/paypal/cancel?link=${key}`,
@@ -662,7 +701,10 @@ ${mandates.length === 0 ? '' : html`<h2>Mandates</h2><div class="card"><table><t
       });
       if (!setup.approveUrl) throw new Error('PayPal returned no approve link');
       pendingLinks.set(key, { setupTokenId: setup.id, createdAt: now() });
-      repo.appendAudit({ actor: 'owner', action: 'mandate.link_started', details: { setupTokenId: setup.id } });
+      pruneLinks();
+      // The audit log is readable on the login-less dashboard: the setup token id goes in masked, like every PayPal
+      // authorization artefact; the unmasked id lives only in pendingLinks until the attempt ends.
+      repo.appendAudit({ actor: 'owner', action: 'mandate.link_started', details: { setupTokenId: mask(setup.id) } });
       return c.redirect(setup.approveUrl, 303);
     } catch (err) {
       // describePayPalError: status, error name, issue codes and debug id, redacted; never PayPal's response body.
@@ -672,17 +714,19 @@ ${mandates.length === 0 ? '' : html`<h2>Mandates</h2><div class="card"><table><t
 
   app.get('/paypal/return', async (c) => {
     const key = c.req.query('link') ?? '';
+    pruneLinks();
     const pending = pendingLinks.get(key);
     if (!paypal || !pending) return c.redirect(`/paypal?error=${encodeURIComponent('Unknown or expired link attempt. Start again.')}`, 303);
+    // One try per attempt: approved or not, failed or not, the attempt is over and the owner starts again.
+    pendingLinks.delete(key);
     try {
       const status = await getSetupToken(paypal, pending.setupTokenId);
       if (status.status !== 'APPROVED') {
-        return c.redirect(`/paypal?error=${encodeURIComponent(`The setup token is ${status.status}, not APPROVED. Approve it with the sandbox personal account, then try again.`)}`, 303);
+        return c.redirect(`/paypal?error=${encodeURIComponent(`The setup token is ${status.status}, not APPROVED. Approve it with the sandbox personal account, then start again.`)}`, 303);
       }
       const token = await createPaymentToken(paypal, pending.setupTokenId, key);
       const mandate = repo.saveMandate({ paypalVaultId: token.vaultId, paypalCustomerId: token.customerId });
-      pendingLinks.delete(key);
-      repo.appendAudit({ actor: 'owner', action: 'mandate.linked', details: { mandateId: mandate.id, setupTokenId: pending.setupTokenId } });
+      repo.appendAudit({ actor: 'owner', action: 'mandate.linked', details: { mandateId: mandate.id, setupTokenId: mask(pending.setupTokenId) } });
       events.publish({ type: 'mandate.linked', at: now() });
       return c.redirect(`/paypal?notice=${encodeURIComponent(`Linked. Mandate ${mandate.id} is active.`)}`, 303);
     } catch (err) {

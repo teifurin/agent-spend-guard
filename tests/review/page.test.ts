@@ -77,6 +77,29 @@ describe('page fetcher', () => {
     ac.abort();
     await expect(pending).rejects.toThrow();
   });
+
+  it('does not start when the review was already cancelled, and releases a body it will not read', async () => {
+    const fetchImpl = vi.fn(async () => htmlResponse('<p>late</p>'));
+    const fetchPage = createPageFetcher({ allowedOrigins: [SHOP], fetch: fetchImpl as unknown as typeof fetch });
+    const cancelled = new AbortController();
+    cancelled.abort();
+    await expect(fetchPage(`${SHOP}/x`, cancelled.signal)).rejects.toThrow();
+    expect(fetchImpl).not.toHaveBeenCalled();
+
+    let released = 0;
+    const endless = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new TextEncoder().encode('{}'));
+      },
+      cancel() {
+        released += 1;
+      },
+    });
+    const jsonFetch = async () => new Response(endless, { status: 200, headers: { 'content-type': 'application/json' } });
+    const fetchJson = createPageFetcher({ allowedOrigins: [SHOP], fetch: jsonFetch as unknown as typeof fetch });
+    expect(await fetchJson(`${SHOP}/json`, never)).toMatchObject({ ok: false, problem: 'not_html' });
+    await vi.waitFor(() => expect(released).toBe(1));
+  });
 });
 
 describe('extractText', () => {

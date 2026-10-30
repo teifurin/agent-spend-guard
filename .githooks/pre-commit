@@ -5,7 +5,7 @@
 set -e
 
 blocked=$(git diff --cached --name-only --diff-filter=AMR \
-  | grep -E '(^|/)(\.env|\.env\.[^/]+|\.spike-state\.json|[^/]+\.db|[^/]+\.db-wal|[^/]+\.db-shm|[^/]+\.sqlite)$' \
+  | grep -E '(^|/)(\.env|\.env\.[^/]+|\.spike-state\.json|[^/]+\.db|[^/]+\.db-journal|[^/]+\.db-wal|[^/]+\.db-shm|[^/]+\.sqlite)$|(^|/)data/' \
   | grep -vE '\.env\.example$' || true)
 if [ -n "$blocked" ]; then
   echo "pre-commit: refusing to commit secret-bearing files:" >&2

@@ -55,6 +55,8 @@ export function createPageFetcher(opts: PageFetcherOptions): PageFetcher {
     const origin = originOf(url);
     if (origin === null) return { ok: false, problem: 'invalid_url' };
     if (!allowed.has(origin)) return { ok: false, problem: 'origin_not_allowed', detail: origin };
+    // A review cancelled before this point (timeout) must not start a request; the listener below only hears later aborts.
+    if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : new Error('the review was cancelled before the page was fetched');
 
     const ac = new AbortController();
     const onAbort = () => ac.abort();
@@ -62,10 +64,23 @@ export function createPageFetcher(opts: PageFetcherOptions): PageFetcher {
     const timer = setTimeout(() => ac.abort(new Error('timeout')), timeoutMs);
     try {
       const res = await fetchImpl(url, { method: 'GET', redirect: 'manual', signal: ac.signal, headers: { Accept: 'text/html' } });
-      if (res.status >= 300 && res.status < 400) return { ok: false, problem: 'redirected' };
-      if (!res.ok) return { ok: false, problem: 'http_error', detail: String(res.status) };
+      // Every early return drops the body it will not read, so the connection is released instead of held until GC.
+      const drop = (): void => {
+        void res.body?.cancel().catch(() => undefined);
+      };
+      if (res.status >= 300 && res.status < 400) {
+        drop();
+        return { ok: false, problem: 'redirected' };
+      }
+      if (!res.ok) {
+        drop();
+        return { ok: false, problem: 'http_error', detail: String(res.status) };
+      }
       const type = res.headers.get('content-type') ?? '';
-      if (!/^text\/html\b/i.test(type)) return { ok: false, problem: 'not_html', detail: type.split(';')[0] };
+      if (!/^text\/html\b/i.test(type)) {
+        drop();
+        return { ok: false, problem: 'not_html', detail: type.split(';')[0] };
+      }
       const { bytes, truncated } = await readCapped(res, maxBytes);
       const text = extractText(new TextDecoder('utf-8', { fatal: false }).decode(bytes));
       const cut = text.length > maxChars;
