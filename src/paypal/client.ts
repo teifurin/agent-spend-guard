@@ -22,6 +22,18 @@ export class PayPalApiError extends Error {
   }
 }
 
+/**
+ * The call to PayPal produced no answer this client can read: no connection, a body that could not be read, or a body
+ * that is not JSON. The message is fixed text chosen here; nothing from the wire or from the underlying error reaches
+ * it, so it can be logged and shown as is. The executor treats it as an open outcome, not as a rejection (D16).
+ */
+export class PayPalTransportError extends Error {
+  constructor(readonly phase: 'connect' | 'read' | 'parse') {
+    super(phase === 'connect' ? 'PayPal could not be reached' : phase === 'read' ? 'the answer from PayPal could not be read' : 'PayPal answered with a body that is not JSON');
+    this.name = 'PayPalTransportError';
+  }
+}
+
 export type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'DELETE';
 
 export interface RequestOptions {
@@ -47,7 +59,9 @@ const TOKEN_REFRESH_MARGIN_MS = 60_000;
 
 /**
  * Minimal PayPal REST client: OAuth token cache, idempotency header, redaction of credentials in errors,
- * and a hard sandbox-only guard on every URL it calls.
+ * and a hard sandbox-only guard on every URL it calls. Redirects are never followed (they could leave the sandbox
+ * host), and every error that leaves this class is either a PayPalApiError with each field redacted or a
+ * PayPalTransportError with fixed text: nothing read from the wire reaches a log or a page unredacted.
  */
 export class PayPalClient {
   readonly redactor = new Redactor();
@@ -75,7 +89,7 @@ export class PayPalClient {
     assertSandboxUrl(url);
     const basic = Buffer.from(`${this.cfg.clientId}:${this.cfg.clientSecret}`).toString('base64');
     this.redactor.add(basic);
-    const res = await this.fetchImpl(url, {
+    const res = await this.connect(url, {
       method: 'POST',
       headers: {
         Authorization: `Basic ${basic}`,
@@ -87,9 +101,9 @@ export class PayPalClient {
       // afterwards, such as "Save payment methods" (Vault), would otherwise stay invisible until it expires.
       body: 'grant_type=client_credentials&ignoreCache=true',
     });
-    const text = await res.text();
+    const text = await this.read(res);
     if (!res.ok) throw this.toError(res.status, text);
-    const json = JSON.parse(text) as { access_token: string; expires_in: number; scope?: string };
+    const json = this.parse<{ access_token: string; expires_in: number; scope?: string }>(text);
     this.token = { value: json.access_token, expiresAt: this.now() + json.expires_in * 1000 };
     this.redactor.add(json.access_token);
     this.log(`POST /v1/oauth2/token -> ${res.status} (token expires in ${json.expires_in}s${describeVaultScope(json.scope)})`);
@@ -105,10 +119,10 @@ export class PayPalClient {
       this.token = undefined;
       res = await this.send(url, method, opts);
     }
-    const text = await res.text();
+    const text = await this.read(res);
     if (!res.ok) throw this.toError(res.status, text);
     this.log(`${method} ${path} -> ${res.status}`);
-    return { status: res.status, data: (text ? JSON.parse(text) : undefined) as T };
+    return { status: res.status, data: (text ? this.parse<T>(text) : undefined) as T };
   }
 
   private async send(url: string, method: HttpMethod, opts: RequestOptions): Promise<Response> {
@@ -121,25 +135,53 @@ export class PayPalClient {
       ...opts.headers,
     };
     if (opts.requestId) headers['PayPal-Request-Id'] = opts.requestId;
-    return this.fetchImpl(url, {
+    return this.connect(url, {
       method,
       headers,
       body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
     });
   }
 
+  /** The transport boundary: a redirect is refused (it could leave the sandbox host, D1) and a thrown connection error becomes fixed text. */
+  private async connect(url: string, init: RequestInit): Promise<Response> {
+    try {
+      return await this.fetchImpl(url, { ...init, redirect: 'error' });
+    } catch {
+      throw new PayPalTransportError('connect');
+    }
+  }
+
+  private async read(res: Response): Promise<string> {
+    try {
+      return await res.text();
+    } catch {
+      throw new PayPalTransportError('read');
+    }
+  }
+
+  /** JSON.parse without its error message, which quotes a piece of the text it choked on. */
+  private parse<T>(text: string): T {
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      throw new PayPalTransportError('parse');
+    }
+  }
+
   private toError(status: number, bodyText: string): PayPalApiError {
     const scrub = (s: string | undefined): string | undefined => (s === undefined ? undefined : this.redactor.redact(s));
     const j = parseJsonObject(bodyText);
-    if (!j) return new PayPalApiError(status, 'UNKNOWN_ERROR', this.redactor.redact(bodyText.slice(0, 300)), undefined, []);
+    // Redact first, cut second: a registered value cut in half would no longer match as a whole.
+    if (!j) return new PayPalApiError(status, 'UNKNOWN_ERROR', this.redactor.redact(bodyText).slice(0, 300), undefined, []);
 
+    // Every string PayPal sent goes through the redactor, the error name and the debug id included: no field is trusted to be clean.
     const rawDetails = Array.isArray(j.details) ? (j.details as Array<Record<string, unknown>>) : [];
     return new PayPalApiError(
       status,
-      str(j.name) ?? str(j.error) ?? 'UNKNOWN_ERROR',
-      this.redactor.redact(str(j.message) ?? str(j.error_description) ?? ''),
-      str(j.debug_id),
-      rawDetails.map((d) => ({ issue: str(d.issue), description: scrub(str(d.description)), field: str(d.field) })),
+      scrub(str(j.name) ?? str(j.error)) ?? 'UNKNOWN_ERROR',
+      scrub(str(j.message) ?? str(j.error_description)) ?? '',
+      scrub(str(j.debug_id)),
+      rawDetails.map((d) => ({ issue: scrub(str(d.issue)), description: scrub(str(d.description)), field: scrub(str(d.field)) })),
     );
   }
 }

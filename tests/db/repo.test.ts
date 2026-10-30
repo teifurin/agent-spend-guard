@@ -187,6 +187,31 @@ describe('budget and merchant history', () => {
     expect(repo.spentThisMonthMinor('research-bot', OCT_27_NOON_JST, 'Asia/Tokyo')).toBe(1200 + 300);
   });
 
+  it('counts an older request still under evaluation for the newer one, never the other way round (D16)', () => {
+    const { repo } = seed();
+    const first = repo.createRequest({ ...baseRequest, amountMinor: 1000 }); // EVALUATING
+    const second = repo.createRequest({ ...baseRequest, amountMinor: 2000 }); // EVALUATING, newer
+    const base = 1200 + 300;
+    expect(repo.spentThisMonthMinor('research-bot', OCT_27_NOON_JST, 'Asia/Tokyo')).toBe(base); // nobody deciding: evaluating requests do not count
+    expect(repo.spentThisMonthMinor('research-bot', OCT_27_NOON_JST, 'Asia/Tokyo', first.id)).toBe(base);
+    expect(repo.spentThisMonthMinor('research-bot', OCT_27_NOON_JST, 'Asia/Tokyo', second.id)).toBe(base + 1000);
+    expect(repo.policyContext('research-bot', OCT_27_NOON_JST, second.id).spentThisMonthMinor).toBe(base + 1000);
+    expect(repo.spentThisMonthMinor('research-bot', OCT_27_NOON_JST, 'Asia/Tokyo', 'req_unknown')).toBe(base);
+  });
+
+  it('lists approved requests whose payment never settled', () => {
+    const { repo } = seed();
+    expect(repo.unsettledRequests()).toEqual([]);
+    const req = repo.createRequest({ ...baseRequest, amountMinor: 800 });
+    repo.setRequestStatus(req.id, 'AUTO_APPROVED');
+    repo.beginPayment(req.id); // CREATED: no answer from PayPal yet
+    expect(repo.unsettledRequests().map((r) => r.id)).toEqual([req.id]);
+    const payment = repo.paymentForRequest(req.id);
+    expect(payment?.status).toBe('CREATED');
+    repo.settlePayment(payment?.id ?? '', { paypalOrderId: 'O', paypalCaptureId: 'C', capturedAt: OCT_27_NOON_JST });
+    expect(repo.unsettledRequests()).toEqual([]);
+  });
+
   it('rolls over at the policy zone month boundary', () => {
     const { repo } = seed();
     const nov2 = Date.UTC(2026, 10, 2, 3, 0);

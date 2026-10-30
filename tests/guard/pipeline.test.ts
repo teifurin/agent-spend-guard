@@ -7,8 +7,8 @@ import { finalFromVerdict, Guard, passthroughReviewer, type Reviewer, tighter } 
 
 const NOON_JST = Date.UTC(2026, 9, 28, 3, 0);
 
-function setup(opts: { reviewer?: Reviewer; reviewTimeoutMs?: number; executor?: PayPalExecutor } = {}) {
-  const repo = new Repo(openDatabase(), () => NOON_JST);
+function setup({ now = () => NOON_JST, ...opts }: { reviewer?: Reviewer; reviewTimeoutMs?: number; executor?: PayPalExecutor; now?: () => number } = {}) {
+  const repo = new Repo(openDatabase(), now);
   repo.createAgent({ id: 'research-bot', name: 'Research bot' });
   repo.savePolicy({
     agentId: 'research-bot',
@@ -22,8 +22,21 @@ function setup(opts: { reviewer?: Reviewer; reviewTimeoutMs?: number; executor?:
     timezone: 'Asia/Tokyo',
     holdNewMerchants: true,
   });
-  const guard = new Guard({ repo, now: () => NOON_JST, ...opts });
+  const guard = new Guard({ repo, now, ...opts });
   return { repo, guard };
+}
+
+/** A reviewer that answers only when the test says so, to hold a request in EVALUATING. */
+function gate() {
+  let release: () => void = () => {};
+  const opened = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const reviewer: Reviewer = async () => {
+    await opened;
+    return { risk: 'low', flags: [], explanation: 'fine', recommendation: 'AUTO_APPROVE' };
+  };
+  return { reviewer, release };
 }
 
 const ok = { agentId: 'research-bot', merchant: 'Synthetic Books', item: 'Field notebook', category: 'books', amountMinor: 1200, currency: 'USD', reason: 'notes for the survey' };
@@ -173,6 +186,82 @@ describe('Guard.submit', () => {
     const held = await guard.submit({ ...ok, amountMinor: 3001 });
     expect(held.payment).toBeNull();
     expect(charge).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('the rules while a review is in flight (D16)', () => {
+  it('lets simultaneous requests through only as far as the budget goes, first come first served', async () => {
+    const { reviewer, release } = gate();
+    const { guard } = setup({ reviewer });
+    const pending = [1, 2, 3, 4].map(() => guard.submit({ ...ok, amountMinor: 3000 })); // 120.00 against a 100.00 budget
+    release();
+    const results = await Promise.all(pending);
+    expect(results.map((r) => r.request.status)).toEqual(['AUTO_APPROVED', 'AUTO_APPROVED', 'AUTO_APPROVED', 'HELD']);
+    expect(results[3]?.policy.reasons.map((r) => r.code)).toEqual(['OVER_MONTHLY_BUDGET']);
+    expect(results[3]?.policy.budget).toMatchObject({ spentMinor: 9000 });
+  });
+
+  it('re-checks the rules after the review: a cap the owner tightened meanwhile holds the request', async () => {
+    const { reviewer, release } = gate();
+    const { repo, guard } = setup({ reviewer });
+    const pending = guard.submit(ok); // 12.00, inside the rules when it started
+    const policy = repo.getPolicy('research-bot');
+    if (!policy) throw new Error('no policy');
+    repo.savePolicy({ ...policy, maxTxMinor: 1000 });
+    release();
+    const result = await pending;
+    expect(result.request.status).toBe('HELD');
+    expect(result.decision.decidedBy).toBe('policy');
+    expect(result.policy.reasons.map((r) => r.code)).toEqual(['OVER_TX_CAP']);
+  });
+
+  it('re-checks the clock: the allowed hours ending during the review hold the request', async () => {
+    let now = NOON_JST;
+    const { reviewer, release } = gate();
+    const { guard } = setup({ reviewer, now: () => now });
+    const pending = guard.submit(ok);
+    now = Date.UTC(2026, 9, 28, 14, 0); // 23:00 Asia/Tokyo, outside 08:00-22:00
+    release();
+    const result = await pending;
+    expect(result.request.status).toBe('HELD');
+    expect(result.policy.reasons.map((r) => r.code)).toEqual(['OUTSIDE_TIME_WINDOW']);
+  });
+
+  it('never loosens: a rule relaxed during the review does not turn a hold into an approval', async () => {
+    const { reviewer, release } = gate();
+    const { repo, guard } = setup({ reviewer });
+    const pending = guard.submit({ ...ok, amountMinor: 3001 }); // over the cap when it started
+    const policy = repo.getPolicy('research-bot');
+    if (!policy) throw new Error('no policy');
+    repo.savePolicy({ ...policy, maxTxMinor: 5000 });
+    release();
+    const result = await pending;
+    expect(result.request.status).toBe('HELD');
+    expect(result.policy.reasons.map((r) => r.code)).toEqual(['OVER_TX_CAP']);
+  });
+});
+
+describe('retrying an unsettled payment (D16)', () => {
+  it('charges again through the executor and audits who asked', async () => {
+    const { charge, executor } = fakeExecutor('CREATED');
+    const { repo, guard } = setup({ executor });
+    const result = await guard.submit(ok);
+    expect(result.payment?.status).toBe('CREATED');
+    expect(result.request.status).toBe('AUTO_APPROVED');
+    const again = await guard.retryCharge(result.request.id, 'owner');
+    expect(charge).toHaveBeenCalledTimes(2);
+    expect(again.status).toBe('CREATED');
+    expect(repo.listAudit({ requestId: result.request.id })[0]).toMatchObject({ actor: 'owner', action: 'payment.retried' });
+  });
+
+  it('refuses without an executor and for requests that are not approved', async () => {
+    const keyless = setup();
+    const held = await keyless.guard.submit({ ...ok, amountMinor: 3001 });
+    await expect(keyless.guard.retryCharge(held.request.id)).rejects.toThrow('keyless');
+    const { executor } = fakeExecutor();
+    const { guard } = setup({ executor });
+    const alsoHeld = await guard.submit({ ...ok, amountMinor: 3001 });
+    await expect(guard.retryCharge(alsoHeld.request.id)).rejects.toThrow('only an approved request');
   });
 });
 

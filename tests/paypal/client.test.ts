@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { PayPalApiError, PayPalClient, requestIdFor } from '../../src/paypal/client.js';
+import { PayPalApiError, PayPalClient, PayPalTransportError, requestIdFor } from '../../src/paypal/client.js';
 import { PAYPAL_SANDBOX_BASE_URL, SandboxOnlyError, type PayPalConfig } from '../../src/paypal/env.js';
 
 const SECRET = 'EsuperSecretValue0000000000000';
@@ -140,6 +140,50 @@ describe('PayPalClient', () => {
     expect(err).toBeInstanceOf(PayPalApiError);
     expect((err as PayPalApiError).paypalName).toBe('invalid_client');
     expect((err as PayPalApiError).message).not.toContain(SECRET);
+  });
+
+  it('never follows a redirect, which could lead away from the sandbox host', async () => {
+    const { calls, fetch } = makeFetch((c) => (isTokenCall(c) ? tokenResponse() : json({ ok: true })));
+    await new PayPalClient(cfg, { fetch }).request('GET', '/v2/checkout/orders/A');
+    expect(calls.length).toBe(2);
+    for (const c of calls) expect(c.init.redirect).toBe('error');
+  });
+
+  it('redacts a non-JSON error body before cutting it, so a secret on the cut is not half shown', async () => {
+    const body = `${'x'.repeat(280)}${SECRET} and more`;
+    const { fetch } = makeFetch((c) => (isTokenCall(c) ? tokenResponse() : new Response(body, { status: 502, headers: { 'Content-Type': 'text/html' } })));
+    const err = (await new PayPalClient(cfg, { fetch }).request('GET', '/v2/checkout/orders/A').catch((e: unknown) => e)) as PayPalApiError;
+    expect(err).toBeInstanceOf(PayPalApiError);
+    expect(err.paypalMessage.length).toBeLessThanOrEqual(300);
+    expect(err.message).toContain('[REDACTED]');
+    expect(err.message).not.toContain(SECRET.slice(0, 8));
+  });
+
+  it('scrubs every field of a JSON error, the error name and the debug id included', async () => {
+    const { fetch } = makeFetch((c) =>
+      isTokenCall(c) ? tokenResponse() : json({ name: `BAD_${SECRET}`, message: 'm', debug_id: SECRET, details: [{ issue: `I_${SECRET}`, field: `/f/${SECRET}`, description: 'd' }] }, 400),
+    );
+    const err = (await new PayPalClient(cfg, { fetch }).request('POST', '/v2/checkout/orders', { body: {} }).catch((e: unknown) => e)) as PayPalApiError;
+    expect(err).toBeInstanceOf(PayPalApiError);
+    expect(JSON.stringify({ message: err.message, name: err.paypalName, debug: err.debugId, details: err.details })).not.toContain(SECRET);
+    expect(err.paypalName).toBe('BAD_[REDACTED]');
+  });
+
+  it('turns a failed connection into a transport error with fixed text, whatever the underlying message said', async () => {
+    const { fetch } = makeFetch(() => {
+      throw new TypeError(`fetch failed while sending ${SECRET}`);
+    });
+    const err = await new PayPalClient(cfg, { fetch }).getAccessToken().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PayPalTransportError);
+    expect((err as Error).message).toBe('PayPal could not be reached');
+    expect(JSON.stringify({ message: (err as Error).message, stack: (err as Error).stack })).not.toContain(SECRET);
+  });
+
+  it('turns a 2xx body that is not JSON into a transport error with fixed text', async () => {
+    const { fetch } = makeFetch((c) => (isTokenCall(c) ? tokenResponse() : new Response(`<html>${SECRET}</html>`, { status: 200, headers: { 'Content-Type': 'text/html' } })));
+    const err = await new PayPalClient(cfg, { fetch }).request('GET', '/v2/checkout/orders/A').catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PayPalTransportError);
+    expect((err as Error).message).toBe('PayPal answered with a body that is not JSON');
   });
 });
 

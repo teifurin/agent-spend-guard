@@ -126,14 +126,48 @@ describe('PayPalExecutor.charge', () => {
     expect(payment.paypalCaptureId).toBe('C4');
   });
 
-  it('records a network failure as PAYMENT_FAILED', async () => {
-    const { repo, executor, request } = setup(() => {
-      throw new TypeError('fetch failed');
+  it('leaves a lost connection unsettled: the request stays approved, the budget stays counted, and a retry settles it (D16)', async () => {
+    const { repo, executor, request, calls } = setup((_call, n) => {
+      if (n === 1) throw new TypeError('fetch failed');
+      return completedOrder('O8', 'C8');
     });
-    const payment = await executor.charge(request.id);
-    expect(payment.status).toBe('FAILED');
-    const failed = repo.listAudit({ requestId: request.id }).find((a) => a.action === 'payment.failed');
-    expect(failed?.details['reason']).toBe('TypeError: fetch failed');
+    const first = await executor.charge(request.id);
+    expect(first.status).toBe('CREATED');
+    expect(repo.getRequest(request.id)?.status).toBe('AUTO_APPROVED');
+    expect(repo.spentThisMonthMinor('research-bot', NOW, 'Asia/Tokyo')).toBe(1200);
+    const open = repo.listAudit({ requestId: request.id }).find((a) => a.action === 'payment.unsettled');
+    expect(open?.details['reason']).toBe('PayPalTransportError: PayPal could not be reached');
+    expect(repo.unsettledRequests().map((r) => r.id)).toEqual([request.id]);
+
+    const second = await executor.charge(request.id);
+    expect(second.status).toBe('COMPLETED');
+    expect(repo.getRequest(request.id)?.status).toBe('PAID');
+    // The create was repeated under the same idempotency key: PayPal would answer with the order it already has.
+    expect(calls.map((c) => `${c.method} ${c.headers['PayPal-Request-Id'] ?? ''}`)).toEqual([`POST ${orderRequestId(request.id)}`, `POST ${orderRequestId(request.id)}`]);
+    expect(repo.unsettledRequests()).toEqual([]);
+  });
+
+  it('keeps a PENDING capture open and settles it once PayPal completes it, without a second create', async () => {
+    const { repo, executor, request, calls } = setup((call) => (call.method === 'GET' ? completedOrder('O9', 'C9') : completedOrder('O9', 'C9', 'PENDING')));
+    const first = await executor.charge(request.id);
+    expect(first.status).toBe('CREATED');
+    expect(first).toMatchObject({ paypalOrderId: 'O9', paypalCaptureId: 'C9' });
+    expect(repo.listAudit({ requestId: request.id }).find((a) => a.action === 'payment.unsettled')?.details['reason']).toBe('capture C9 is PENDING');
+
+    const second = await executor.charge(request.id);
+    expect(second.status).toBe('COMPLETED');
+    expect(calls.map((c) => `${c.method} ${c.url.replace(PAYPAL_SANDBOX_BASE_URL, '')}`)).toEqual(['POST /v2/checkout/orders', 'GET /v2/checkout/orders/O9']);
+  });
+
+  it('treats a 5xx as unsettled and a 4xx as final', async () => {
+    const open = setup(() => json({ name: 'INTERNAL_SERVER_ERROR', message: 'try later', debug_id: 'd5' }, 503));
+    expect((await open.executor.charge(open.request.id)).status).toBe('CREATED');
+    expect(open.repo.getRequest(open.request.id)?.status).toBe('AUTO_APPROVED');
+    expect(open.repo.listAudit({ requestId: open.request.id }).find((a) => a.action === 'payment.unsettled')?.details['reason']).toBe('PayPal 503 INTERNAL_SERVER_ERROR debug_id=d5');
+
+    const refused = setup(() => json({ name: 'UNPROCESSABLE_ENTITY', message: 'no', debug_id: 'd4', details: [{ issue: 'INSTRUMENT_DECLINED' }] }, 422));
+    expect((await refused.executor.charge(refused.request.id)).status).toBe('FAILED');
+    expect(refused.repo.getRequest(refused.request.id)?.status).toBe('PAYMENT_FAILED');
   });
 
   it('fails without any PayPal call when the owner has not linked PayPal', async () => {

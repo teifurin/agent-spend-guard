@@ -5,6 +5,7 @@
  */
 import { randomBytes } from 'node:crypto';
 import { Hono } from 'hono';
+import { csrf } from 'hono/csrf';
 import { html, raw } from 'hono/html';
 import { streamSSE } from 'hono/streaming';
 import { z } from 'zod';
@@ -14,6 +15,7 @@ import type { Agent, AuditEntry, Decision, Mandate, Payment, Policy, PurchaseReq
 import type { PayPalExecutor } from '../guard/executor.js';
 import type { Guard } from '../guard/pipeline.js';
 import type { PayPalClient } from '../paypal/client.js';
+import { describePayPalError } from '../paypal/errors.js';
 import { createPaymentToken, createSetupToken, getSetupToken } from '../paypal/vault.js';
 import { monthBounds } from '../policy/time.js';
 import { validatePolicy } from '../policy/validate.js';
@@ -66,6 +68,37 @@ function safeUrl(value: string | null | undefined): string | null {
   }
 }
 
+const bareHost = (hostname: string): string => hostname.replace(/^\[|\]$/g, '').toLowerCase();
+
+/**
+ * Hosts the guard answers to: loopback names on any port, plus the host the owner configured as PUBLIC_BASE_URL (the
+ * LAN address when the dashboard is shown on a phone). Any other Host header is a DNS-rebinding attempt or a misrouted
+ * proxy and is refused before any route runs (D16).
+ */
+export function hostAllowed(requestUrl: string, publicBaseUrl: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(requestUrl);
+  } catch {
+    return false;
+  }
+  const hostname = bareHost(url.hostname);
+  if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1') return true;
+  try {
+    const configured = new URL(publicBaseUrl);
+    return url.host.toLowerCase() === configured.host.toLowerCase() || hostname === bareHost(configured.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/** The event a finished charge publishes: CREATED means PayPal never confirmed the outcome (D16). */
+const paymentEvent = (payment: Payment): string => (payment.status === 'COMPLETED' ? 'payment.captured' : payment.status === 'CREATED' ? 'payment.unsettled' : 'payment.failed');
+
+/** An approved request whose charge stopped without PayPal's answer: payment row still CREATED. */
+const isUnsettled = (request: PurchaseRequest, payment: Payment | undefined): boolean =>
+  payment?.status === 'CREATED' && (request.status === 'AUTO_APPROVED' || request.status === 'APPROVED');
+
 // ------------------------------------------------------------------ view models
 
 const MESSAGES: Record<RequestStatus, string> = {
@@ -113,7 +146,7 @@ export function requestView(repo: Repo, request: PurchaseRequest) {
         }
       : null,
     payment: payment ? { status: payment.status, paypal_order_id: payment.paypalOrderId, paypal_capture_id: payment.paypalCaptureId, paypal_refund_id: payment.paypalRefundId } : null,
-    message: `${MESSAGES[request.status]}${reasons.length > 0 ? ` Reasons: ${reasons.map((r) => r.message).join('; ')}.` : ''}${reviewMessage}`,
+    message: `${MESSAGES[request.status]}${isUnsettled(request, payment) ? ' PayPal has not confirmed the charge yet; the owner will settle it. Do not retry the purchase.' : ''}${reasons.length > 0 ? ` Reasons: ${reasons.map((r) => r.message).join('; ')}.` : ''}${reviewMessage}`,
   };
 }
 
@@ -347,11 +380,19 @@ export function createApp(deps: AppDeps): Hono {
   const pendingLinks = new Map<string, { setupTokenId: string; createdAt: number }>();
   const app = new Hono();
 
+  // Order matters (D16): the Host check runs before any route (DNS rebinding of a loopback server); hono/csrf then
+  // refuses a POST with a form content type unless its Origin or Sec-Fetch-Site says same-origin (JSON from the MCP
+  // server is not a form type and needs no Origin); every response leaves with headers that keep the dashboard out of
+  // frames on other sites and stop content sniffing.
   app.use('*', async (c, next) => {
+    if (!hostAllowed(c.req.url, deps.publicBaseUrl)) return c.text('Unexpected Host header: the guard answers on localhost and on PUBLIC_BASE_URL only.', 400);
     await next();
     c.header('X-Content-Type-Options', 'nosniff');
     c.header('Referrer-Policy', 'no-referrer');
+    c.header('Content-Security-Policy', "frame-ancestors 'none'");
+    c.header('X-Frame-Options', 'DENY');
   });
+  app.use('*', csrf());
 
   const publishRequest = (type: string, request: PurchaseRequest): void => {
     events.publish({ type, requestId: request.id, agentId: request.agentId, status: request.status, at: now() });
@@ -363,6 +404,7 @@ export function createApp(deps: AppDeps): Hono {
     const nowMs = now();
     const agents = repo.listAgents();
     const held = repo.listRequests({ status: 'HELD', limit: 50 });
+    const unsettled = repo.unsettledRequests();
     const recent = repo.listRequests({ limit: 20 });
     const mandate = repo.activeMandate();
     const body = html`<h1>Overview</h1>
@@ -382,6 +424,11 @@ ${agents.map((a) => {
 </div>`;
 })}
 </div>
+${unsettled.length === 0 ? '' : html`<h2>Payments to settle (${unsettled.length})</h2>
+${unsettled.map((r) => html`<div class="card">
+  <div class="actions"><strong>${money(r.amountMinor, r.currency)}</strong> at <strong class="wrap">${r.merchant}</strong> <span class="muted">by ${r.agentId}</span> ${badge(r.status)}</div>
+  <div class="muted">PayPal did not confirm this charge. The amount still counts against the budget. <a href="/requests/${r.id}">Open and retry</a></div>
+</div>`)}`}
 <h2>Waiting for you (${held.length})</h2>
 ${held.length === 0 ? html`<p class="muted">Nothing is waiting.</p>` : ''}
 ${held.map((r) => {
@@ -412,11 +459,15 @@ ${requestTable(
     if (!request) return c.html(page('Not found', html`<h1>Unknown request</h1>`), 404);
     const decision = repo.latestDecision(request.id);
     const payment = repo.paymentForRequest(request.id);
-    const audit = [...repo.listAudit({ requestId: request.id })].reverse();
+    const newestFirst = repo.listAudit({ requestId: request.id });
+    const audit = [...newestFirst].reverse();
     const url = safeUrl(request.sourceUrl);
     const notice = c.req.query('notice');
+    const unsettled = isUnsettled(request, payment);
+    const unsettledReason = unsettled ? newestFirst.find((a) => a.action === 'payment.unsettled')?.details['reason'] : undefined;
     const body = html`<h1>Request <span class="mono">${request.id}</span> ${badge(request.status)}</h1>
 ${notice ? html`<div class="notice">${notice}</div>` : ''}
+${unsettled ? html`<div class="error"><strong>Payment outcome unknown.</strong> ${typeof unsettledReason === 'string' ? html`${unsettledReason}. ` : ''}PayPal may or may not have charged this; the amount stays counted against the budget until it is settled. Retrying looks the order up first and cannot charge twice.</div>` : ''}
 <div class="card">
 <table>
 <tr><th>Agent</th><td>${request.agentId}</td></tr>
@@ -432,6 +483,7 @@ ${notice ? html`<div class="notice">${notice}</div>` : ''}
 <div class="actions decide">
 ${request.status === 'HELD' ? html`<form method="post" action="/requests/${request.id}/approve"><button type="submit">Approve &amp; pay</button></form><form method="post" action="/requests/${request.id}/deny"><input type="hidden" name="note" value=""><button type="submit" class="deny">Deny</button></form>` : ''}
 ${request.status === 'PAID' && executor ? html`<form method="post" action="/requests/${request.id}/refund"><button type="submit" class="ghost">Refund</button></form>` : ''}
+${unsettled && executor ? html`<form method="post" action="/requests/${request.id}/charge"><button type="submit">Retry payment</button></form>` : ''}
 </div>
 <h2>Decision</h2>
 <div class="card">${decisionBlock(decision)}</div>
@@ -447,11 +499,36 @@ ${request.status === 'PAID' && executor ? html`<form method="post" action="/requ
     try {
       const { request, payment } = await guard.approve(id, 'owner');
       publishRequest('owner.approved', request);
-      if (payment) publishRequest(payment.status === 'COMPLETED' ? 'payment.captured' : 'payment.failed', request);
-      const notice = payment ? (payment.status === 'COMPLETED' ? `Approved and paid (capture ${payment.paypalCaptureId ?? '?'}).` : 'Approved, but the payment failed.') : 'Approved. Nothing was charged (keyless mode).';
+      if (payment) publishRequest(paymentEvent(payment), request);
+      const notice = !payment
+        ? 'Approved. Nothing was charged (keyless mode).'
+        : payment.status === 'COMPLETED'
+          ? `Approved and paid (capture ${payment.paypalCaptureId ?? '?'}).`
+          : payment.status === 'CREATED'
+            ? 'Approved, but PayPal did not confirm the charge. Retry it from the payment section below.'
+            : 'Approved, but the payment failed.';
       return c.redirect(`/requests/${id}?notice=${encodeURIComponent(notice)}`, 303);
     } catch (err) {
       return c.html(page('Error', html`<h1>Could not approve</h1><div class="error">${err instanceof Error ? err.message : String(err)}</div><p><a href="/requests/${id}">Back</a></p>`), 409);
+    }
+  });
+
+  app.post('/requests/:id/charge', async (c) => {
+    const id = c.req.param('id');
+    if (!executor) return c.html(page('Error', html`<h1>Retrying a payment needs PayPal credentials</h1>`), 503);
+    try {
+      const payment = await guard.retryCharge(id, 'owner');
+      const request = repo.getRequest(id);
+      if (request) publishRequest(paymentEvent(payment), request);
+      const notice =
+        payment.status === 'COMPLETED'
+          ? `Paid (capture ${payment.paypalCaptureId ?? '?'}).`
+          : payment.status === 'FAILED'
+            ? 'PayPal refused the charge; nothing was paid and the budget is free again.'
+            : 'Still unsettled: PayPal did not confirm the outcome. Try again in a moment.';
+      return c.redirect(`/requests/${id}?notice=${encodeURIComponent(notice)}`, 303);
+    } catch (err) {
+      return c.html(page('Error', html`<h1>Could not retry the payment</h1><div class="error">${err instanceof Error ? err.message : String(err)}</div><p><a href="/requests/${id}">Back</a></p>`), 409);
     }
   });
 
@@ -588,7 +665,8 @@ ${mandates.length === 0 ? '' : html`<h2>Mandates</h2><div class="card"><table><t
       repo.appendAudit({ actor: 'owner', action: 'mandate.link_started', details: { setupTokenId: setup.id } });
       return c.redirect(setup.approveUrl, 303);
     } catch (err) {
-      return c.html(page('PayPal', paypalPage(undefined, `Could not start the link: ${err instanceof Error ? err.message : String(err)}`)), 502);
+      // describePayPalError: status, error name, issue codes and debug id, redacted; never PayPal's response body.
+      return c.html(page('PayPal', paypalPage(undefined, `Could not start the link: ${describePayPalError(err, paypal)}`)), 502);
     }
   });
 
@@ -608,7 +686,7 @@ ${mandates.length === 0 ? '' : html`<h2>Mandates</h2><div class="card"><table><t
       events.publish({ type: 'mandate.linked', at: now() });
       return c.redirect(`/paypal?notice=${encodeURIComponent(`Linked. Mandate ${mandate.id} is active.`)}`, 303);
     } catch (err) {
-      return c.redirect(`/paypal?error=${encodeURIComponent(`Could not finish the link: ${err instanceof Error ? err.message : String(err)}`)}`, 303);
+      return c.redirect(`/paypal?error=${encodeURIComponent(`Could not finish the link: ${describePayPalError(err, paypal)}`)}`, 303);
     }
   });
 
@@ -638,6 +716,8 @@ ${mandates.length === 0 ? '' : html`<h2>Mandates</h2><div class="card"><table><t
   // -------------------------------------------------------------- agent API (what the MCP server calls)
 
   app.post('/api/requests', async (c) => {
+    // JSON only. A browser can send text/plain cross-site without a preflight; application/json it cannot (D16).
+    if (!/^application\/json\b/i.test(c.req.header('content-type') ?? '')) return c.json({ error: 'unsupported_media_type', message: 'Send the request as application/json.' }, 415);
     let raw: unknown;
     try {
       raw = await c.req.json();
@@ -662,7 +742,7 @@ ${mandates.length === 0 ? '' : html`<h2>Mandates</h2><div class="card"><table><t
       sourceUrl: input.source_url ?? null,
     });
     publishRequest('request.decided', result.request);
-    if (result.payment) publishRequest(result.payment.status === 'COMPLETED' ? 'payment.captured' : 'payment.failed', result.request);
+    if (result.payment) publishRequest(paymentEvent(result.payment), result.request);
     return c.json(requestView(repo, result.request), 201);
   });
 

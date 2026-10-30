@@ -10,7 +10,7 @@ import { PayPalClient } from '../../src/paypal/client.js';
 import { PAYPAL_SANDBOX_BASE_URL, type PayPalConfig } from '../../src/paypal/env.js';
 import { createMockReviewer, MOCK_REVIEWER_LABEL } from '../../src/review/mock.js';
 import { createPageFetcher } from '../../src/review/page.js';
-import { createApp } from '../../src/server/app.js';
+import { createApp, hostAllowed } from '../../src/server/app.js';
 import { EventBus, type GuardEvent } from '../../src/server/events.js';
 import { createShopApp } from '../../src/shop/app.js';
 
@@ -20,11 +20,16 @@ const NOW = Date.UTC(2026, 9, 28, 3, 0); // 12:00 Asia/Tokyo, inside the demo ho
 class FakeExecutor {
   constructor(
     private readonly repo: Repo,
-    public outcome: 'COMPLETED' | 'FAILED' = 'COMPLETED',
+    public outcome: 'COMPLETED' | 'FAILED' | 'UNSETTLED' = 'COMPLETED',
   ) {}
   async charge(requestId: string): Promise<Payment> {
     const payment = this.repo.beginPayment(requestId);
     if (payment.status !== 'CREATED') return payment;
+    if (this.outcome === 'UNSETTLED') {
+      // what the real executor does when PayPal never answers: the payment stays CREATED, the request stays approved
+      this.repo.appendAudit({ actor: 'system', action: 'payment.unsettled', requestId, agentId: payment.agentId, details: { paymentId: payment.id, reason: 'PayPalTransportError: PayPal could not be reached' } });
+      return payment;
+    }
     return this.outcome === 'COMPLETED' ? this.repo.settlePayment(payment.id, { paypalOrderId: 'O-fake', paypalCaptureId: 'C-fake', capturedAt: NOW }) : this.repo.failPayment(payment.id);
   }
   async refund(requestId: string): Promise<Payment> {
@@ -34,7 +39,7 @@ class FakeExecutor {
   }
 }
 
-function setup(opts: { executor?: boolean; paypal?: PayPalClient; outcome?: 'COMPLETED' | 'FAILED' } = {}) {
+function setup(opts: { executor?: boolean; paypal?: PayPalClient; outcome?: 'COMPLETED' | 'FAILED' | 'UNSETTLED' } = {}) {
   const repo = new Repo(openDatabase(), () => NOW);
   seedDemo(repo);
   const events = new EventBus();
@@ -48,8 +53,9 @@ function setup(opts: { executor?: boolean; paypal?: PayPalClient; outcome?: 'COM
 }
 
 const postJson = (app: Hono, path: string, body: unknown) => app.request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+// A browser posting a dashboard form sends Origin (or Sec-Fetch-Site: same-origin); hono/csrf refuses the form without it (D16).
 const postForm = (app: Hono, path: string, fields: Record<string, string> = {}) =>
-  app.request(path, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(fields).toString() });
+  app.request(path, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', origin: 'http://localhost' }, body: new URLSearchParams(fields).toString() });
 
 const notebook = {
   agent_id: DEMO_AGENT_ID,
@@ -276,6 +282,96 @@ describe('owner dashboard', () => {
   });
 });
 
+describe('browser-facing protections (D16)', () => {
+  it('refuses owner actions posted from another site, and takes the same ones from the dashboard', async () => {
+    const { app, repo } = setup();
+    const held = (await (await postJson(app, '/api/requests', microscope)).json()) as ApiRequest;
+    const foreign = await app.request(`/requests/${held.request_id}/approve`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', origin: 'https://evil.example' } });
+    expect(foreign.status).toBe(403);
+    expect(repo.getRequest(held.request_id)?.status).toBe('HELD');
+
+    // The blind chain needs no request id: loosen the rules, then buy. The first step is refused.
+    const blind = await app.request(`/policies/${DEMO_AGENT_ID}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'sec-fetch-site': 'cross-site' },
+      body: 'currency=USD&max_tx=999.00&monthly_budget=9999.00&timezone=Asia/Tokyo',
+    });
+    expect(blind.status).toBe(403);
+    expect(repo.getPolicy(DEMO_AGENT_ID)?.maxTxMinor).toBe(3000);
+
+    const own = await app.request(`/requests/${held.request_id}/approve`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'sec-fetch-site': 'same-origin' } });
+    expect(own.status).toBe(303);
+    expect(repo.getRequest(held.request_id)?.status).toBe('PAID');
+  });
+
+  it('takes agent requests as application/json only, so a cross-site text/plain post cannot create one', async () => {
+    const { app, published } = setup();
+    const plain = await app.request('/api/requests', { method: 'POST', headers: { 'Content-Type': 'text/plain', origin: 'https://evil.example' }, body: JSON.stringify(notebook) });
+    expect(plain.status).toBe(403); // a form-type post from another site
+    const ownPlain = await app.request('/api/requests', { method: 'POST', headers: { 'Content-Type': 'text/plain', 'sec-fetch-site': 'same-origin' }, body: JSON.stringify(notebook) });
+    expect(ownPlain.status).toBe(415); // the wrong media type even from here
+    expect(published.length).toBe(0);
+    expect((await postJson(app, '/api/requests', notebook)).status).toBe(201); // the MCP server: JSON, no Origin header at all
+  });
+
+  it('answers only to its own host names', async () => {
+    const { app } = setup();
+    expect((await app.request('http://evil.example/')).status).toBe(400);
+    expect((await app.request('http://evil.example/api/health')).status).toBe(400);
+    expect((await app.request('http://127.0.0.1:3000/')).status).toBe(200);
+    expect((await app.request('http://localhost:3000/api/health')).status).toBe(200);
+    expect((await app.request('http://[::1]:3000/api/health')).status).toBe(200);
+    expect(hostAllowed('http://192.168.1.20:3000/', 'http://192.168.1.20:3000')).toBe(true); // the phone demo, PUBLIC_BASE_URL set
+    expect(hostAllowed('http://192.168.1.20:3000/', 'http://localhost:3000')).toBe(false);
+    expect(hostAllowed('not a url', 'http://localhost:3000')).toBe(false);
+  });
+
+  it('sends the headers that keep the dashboard out of frames on other sites', async () => {
+    const { app } = setup();
+    const res = await app.request('/');
+    expect(res.headers.get('content-security-policy')).toBe("frame-ancestors 'none'");
+    expect(res.headers.get('x-frame-options')).toBe('DENY');
+    expect(res.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+  });
+});
+
+describe('unsettled payments (D16)', () => {
+  it('keeps an approved request whose charge got no answer on the budget, shows it, and lets the owner retry', async () => {
+    const { app, repo, fake, published } = setup({ outcome: 'UNSETTLED' });
+    const body = (await (await postJson(app, '/api/requests', notebook)).json()) as ApiRequest;
+    expect(body.status).toBe('AUTO_APPROVED');
+    expect(body.payment?.status).toBe('CREATED');
+    expect(body.message).toContain('has not confirmed the charge');
+    expect(published.map((e) => e.type)).toEqual(['request.decided', 'payment.unsettled']);
+    expect(repo.spentThisMonthMinor(DEMO_AGENT_ID, NOW, 'Asia/Tokyo')).toBe(1200);
+
+    expect(await (await app.request('/')).text()).toContain('Payments to settle (1)');
+    const page = await (await app.request(`/requests/${body.request_id}`)).text();
+    expect(page).toContain('Payment outcome unknown');
+    expect(page).toContain('PayPal could not be reached');
+    expect(page).toContain(`/requests/${body.request_id}/charge`);
+
+    fake.outcome = 'COMPLETED';
+    const retry = await postForm(app, `/requests/${body.request_id}/charge`);
+    expect(retry.status).toBe(303);
+    expect(retry.headers.get('location')).toContain('Paid');
+    expect(repo.getRequest(body.request_id)?.status).toBe('PAID');
+    expect(published.at(-1)?.type).toBe('payment.captured');
+    expect(repo.listAudit({ requestId: body.request_id }).map((a) => a.action)).toContain('payment.retried');
+    expect(await (await app.request('/')).text()).not.toContain('Payments to settle');
+  });
+
+  it('refuses to retry anything but an approved request with an open payment', async () => {
+    const { app } = setup();
+    const paid = (await (await postJson(app, '/api/requests', notebook)).json()) as ApiRequest;
+    expect((await postForm(app, `/requests/${paid.request_id}/charge`)).status).toBe(409);
+    const keyless = setup({ executor: false });
+    const auto = (await (await postJson(keyless.app, '/api/requests', notebook)).json()) as ApiRequest;
+    expect((await postForm(keyless.app, `/requests/${auto.request_id}/charge`)).status).toBe(503);
+  });
+});
+
 describe('policy editor', () => {
   it('saves valid rules and rejects invalid ones with a message', async () => {
     const { app, repo, published } = setup();
@@ -354,5 +450,20 @@ describe('PayPal link flow', () => {
     const { app } = setup();
     expect((await postForm(app, '/paypal/link')).status).toBe(503);
     expect(await (await app.request('/paypal')).text()).toContain('needs PayPal sandbox credentials');
+  });
+
+  it('shows a redacted, fixed-shape message when PayPal fails during linking, never the response body', async () => {
+    const SECRET = 'EsuperSecretValue0000000000000';
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith('/v1/oauth2/token')) return json({ access_token: 'A21AAfakeAccessTokenValue000000', expires_in: 3600 });
+      return json({ name: `INVALID_REQUEST_${SECRET}`, message: `secret ${SECRET} in the message`, debug_id: SECRET, details: [{ issue: 'PERMISSION_DENIED', description: SECRET }] }, 403);
+    });
+    const { app } = setup({ paypal: new PayPalClient(cfg, { fetch: fetchMock as unknown as typeof fetch }) });
+    const res = await postForm(app, '/paypal/link');
+    expect(res.status).toBe(502);
+    const text = await res.text();
+    expect(text).toContain('Could not start the link: PayPal 403');
+    expect(text).toContain('PERMISSION_DENIED');
+    expect(text).not.toContain(SECRET);
   });
 });

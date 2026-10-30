@@ -495,14 +495,35 @@ export class Repo {
   /**
    * Spend that counts against the agent's budget for the month containing nowMs in the given zone:
    * completed captures in that month plus approved requests not yet captured. Refunded captures do not count.
+   *
+   * While a request is being decided (`deciding` = its id), the agent's older requests that are still EVALUATING count
+   * too, first come first served: of two requests submitted at the same moment, the older one sees a free budget and
+   * the newer one sees the older one's amount, so they cannot both pass a budget that fits only one (D16).
    */
-  spentThisMonthMinor(agentId: string, nowMs: number, timezone: string): number {
+  spentThisMonthMinor(agentId: string, nowMs: number, timezone: string, deciding?: string): number {
     const { startMs, endMs } = monthBounds(nowMs, timezone);
     const captured = this.db
       .prepare(`SELECT COALESCE(SUM(amount_minor), 0) AS total FROM payments WHERE agent_id = ? AND status = 'COMPLETED' AND captured_at >= ? AND captured_at < ?`)
       .get(agentId, startMs, endMs);
-    const inFlight = this.db.prepare(`SELECT COALESCE(SUM(amount_minor), 0) AS total FROM requests WHERE agent_id = ? AND status IN ${IN_FLIGHT_SQL}`).get(agentId);
+    const inFlight = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(amount_minor), 0) AS total FROM requests
+         WHERE agent_id = ? AND (status IN ${IN_FLIGHT_SQL}
+           OR (status = 'EVALUATING' AND rowid < COALESCE((SELECT rowid FROM requests WHERE id = ?), 0)))`,
+      )
+      .get(agentId, deciding ?? '');
     return num(captured?.['total'] ?? 0) + num(inFlight?.['total'] ?? 0);
+  }
+
+  /** Approved requests whose charge stopped without a known outcome: payment still CREATED, amount still counted (D16). */
+  unsettledRequests(): PurchaseRequest[] {
+    return this.db
+      .prepare(
+        `SELECT r.* FROM requests r JOIN payments p ON p.request_id = r.id
+         WHERE p.status = 'CREATED' AND r.status IN ${IN_FLIGHT_SQL} ORDER BY r.created_at ASC, r.id ASC`,
+      )
+      .all()
+      .map((row) => toRequest(row as Row));
   }
 
   /** Normalized merchant names this agent has paid before, sorted. */
@@ -513,10 +534,13 @@ export class Repo {
       .map((row) => str(row['merchant_key']));
   }
 
-  /** Everything the policy engine needs besides the policy itself. Uses the policy's zone (UTC when there is none). */
-  policyContext(agentId: string, nowMs: number = this.now()): PolicyContext {
+  /**
+   * Everything the policy engine needs besides the policy itself. Uses the policy's zone (UTC when there is none).
+   * `deciding` is the id of the request being decided, so that its older siblings still under evaluation count (see spentThisMonthMinor).
+   */
+  policyContext(agentId: string, nowMs: number = this.now(), deciding?: string): PolicyContext {
     const timezone = this.getPolicy(agentId)?.timezone ?? 'UTC';
-    return { nowMs, spentThisMonthMinor: this.spentThisMonthMinor(agentId, nowMs, timezone), knownMerchants: this.knownMerchants(agentId) };
+    return { nowMs, spentThisMonthMinor: this.spentThisMonthMinor(agentId, nowMs, timezone, deciding), knownMerchants: this.knownMerchants(agentId) };
   }
 
   // ----------------------------------------------------------------- audit

@@ -3,12 +3,15 @@
  * against the owner's vaulted PayPal (the active mandate), buyer absent; refunds go through Payments v2.
  *
  * State changes follow D10: the payment row and the request status change together, in one transaction, and
- * PayPal is only ever called outside a transaction. PayPal-side failures are recorded (PAYMENT_FAILED), not thrown;
- * programming errors (charging a request that is not approved) are thrown.
+ * PayPal is only ever called outside a transaction. A rejection by PayPal is recorded (PAYMENT_FAILED), not thrown.
+ * An outcome PayPal never confirmed (no connection, an unreadable answer, a 5xx, a PENDING capture) is left open:
+ * the payment stays CREATED, the request stays approved and the amount keeps counting against the budget until the
+ * owner retries and the idempotent replay finds out what happened (D16). Programming errors are thrown.
  */
 import type { Repo } from '../db/repo.js';
 import type { Payment } from '../domain/types.js';
 import { PayPalApiError, type PayPalClient } from '../paypal/client.js';
+import { describePayPalError } from '../paypal/errors.js';
 import { captureOf, captureOrder, createVaultOrder, getOrder, type PayPalCapture, type PayPalOrder, refundCapture } from '../paypal/orders.js';
 
 export interface ExecutorDeps {
@@ -28,6 +31,15 @@ export class ExecutorError extends Error {
 
 const ACTOR = 'system';
 
+/** Why a charge stopped short of a capture: PayPal said no (`failed`), or nobody knows what PayPal did (`unsettled`). */
+interface Stop {
+  kind: 'failed' | 'unsettled';
+  reason: string;
+}
+
+/** PayPal processed the call and refused it: a 4xx. Anything else (5xx, no connection, unreadable answer) leaves the outcome open. */
+const isFinalRejection = (err: unknown): boolean => err instanceof PayPalApiError && err.status >= 400 && err.status < 500;
+
 export class PayPalExecutor {
   private readonly client: PayPalClient;
   private readonly repo: Repo;
@@ -42,9 +54,10 @@ export class PayPalExecutor {
   }
 
   /**
-   * Charges an AUTO_APPROVED or APPROVED request through the active mandate and returns the payment,
-   * COMPLETED (request PAID) or FAILED (request PAYMENT_FAILED). Safe to call again after a crash:
-   * an order id already recorded is looked up instead of re-created, and idempotency keys repeat.
+   * Charges an AUTO_APPROVED or APPROVED request through the active mandate and returns the payment: COMPLETED
+   * (request PAID), FAILED (request PAYMENT_FAILED), or still CREATED when PayPal never confirmed the outcome (the
+   * request stays approved, see the header). Safe to call again, after a crash or as the owner's retry: an order id
+   * already recorded is looked up instead of re-created, and idempotency keys repeat.
    */
   async charge(requestId: string): Promise<Payment> {
     const request = this.repo.getRequest(requestId);
@@ -75,11 +88,11 @@ export class PayPalExecutor {
 
     let orderId: string | null = payment.paypalOrderId;
     let capture: PayPalCapture | undefined;
-    let failure: string | undefined;
+    let stop: Stop | undefined;
     try {
       let order: PayPalOrder;
       if (orderId) {
-        order = await getOrder(this.client, orderId); // resume: the order exists, find out how far it got
+        order = await getOrder(this.client, orderId); // resume or retry: the order exists, find out how far it got
       } else {
         order = await createVaultOrder(this.client, request, mandate.paypalVaultId);
         orderId = order.id;
@@ -89,28 +102,38 @@ export class PayPalExecutor {
 
       if (order.status === 'COMPLETED') {
         capture = captureOf(order);
-        if (!capture) failure = 'order is COMPLETED but carries no capture';
+        if (!capture) stop = { kind: 'unsettled', reason: 'order is COMPLETED but carries no capture object' };
       } else if (order.status === 'APPROVED' || order.status === 'CREATED') {
         const captured = await captureOrder(this.client, request.id, order.id);
         capture = captureOf(captured);
-        if (!capture) failure = `capture returned ${captured.status} without a capture object`;
+        if (!capture) stop = { kind: 'unsettled', reason: `capture returned ${captured.status} without a capture object` };
       } else {
-        failure = `order is ${order.status}: the vaulted PayPal could not be charged with the buyer absent`;
+        stop = { kind: 'failed', reason: `order is ${order.status}: the vaulted PayPal could not be charged with the buyer absent` };
       }
-      if (capture && capture.status !== 'COMPLETED') failure = `capture ${capture.id} is ${capture.status}`;
+      if (capture && capture.status !== 'COMPLETED') {
+        // DECLINED and FAILED are PayPal's final word. PENDING (or a status this code does not know) may still complete.
+        const refused = capture.status === 'DECLINED' || capture.status === 'FAILED';
+        stop = { kind: refused ? 'failed' : 'unsettled', reason: `capture ${capture.id} is ${capture.status}` };
+      }
     } catch (err) {
-      failure = describe(err, this.client);
+      stop = { kind: isFinalRejection(err) ? 'failed' : 'unsettled', reason: describePayPalError(err, this.client) };
     }
+    if (stop === undefined && !capture) stop = { kind: 'unsettled', reason: 'no capture object in the answer' };
 
-    if (failure !== undefined || !capture) {
+    if (stop?.kind === 'unsettled') {
+      // PayPal may or may not have moved the money. Marking the payment FAILED would free the budget on a guess, so
+      // it stays CREATED and the request stays approved; the owner retries from the dashboard and the replay under
+      // the same idempotency keys finds out what happened without charging twice (D8, D16).
+      if (capture && payment.paypalCaptureId !== capture.id) payment = this.repo.updatePayment(payment.id, { paypalCaptureId: capture.id });
+      this.audit('payment.unsettled', request.id, request.agentId, { paymentId: payment.id, paypalOrderId: orderId, paypalCaptureId: capture?.id ?? null, reason: stop.reason });
+      this.log(`payment ${payment.id} UNSETTLED: ${stop.reason}; the owner can retry`);
+      return payment;
+    }
+    if (stop !== undefined || !capture) {
+      const reason = stop?.reason ?? 'no capture';
       const failed = this.repo.failPayment(payment.id, { paypalOrderId: orderId, paypalCaptureId: capture?.id ?? null });
-      this.audit('payment.failed', request.id, request.agentId, {
-        paymentId: payment.id,
-        paypalOrderId: orderId,
-        paypalCaptureId: capture?.id ?? null,
-        reason: failure ?? 'no capture',
-      });
-      this.log(`payment ${payment.id} FAILED: ${failure ?? 'no capture'}`);
+      this.audit('payment.failed', request.id, request.agentId, { paymentId: payment.id, paypalOrderId: orderId, paypalCaptureId: capture?.id ?? null, reason });
+      this.log(`payment ${payment.id} FAILED: ${reason}`);
       return failed;
     }
 
@@ -143,7 +166,7 @@ export class PayPalExecutor {
       if (refund.status !== 'COMPLETED' && refund.status !== 'PENDING') throw new ExecutorError(`refund ${refund.id} is ${refund.status}`);
       refundId = refund.id;
     } catch (err) {
-      const reason = describe(err, this.client);
+      const reason = describePayPalError(err, this.client);
       this.audit('refund.failed', request.id, request.agentId, { paymentId: payment.id, paypalCaptureId: payment.paypalCaptureId, reason });
       throw err instanceof ExecutorError ? err : new ExecutorError(`refund failed: ${reason}`);
     }
@@ -157,13 +180,4 @@ export class PayPalExecutor {
   private audit(action: string, requestId: string, agentId: string, details: Record<string, unknown>): void {
     this.repo.appendAudit({ actor: ACTOR, action, requestId, agentId, details });
   }
-}
-
-/** A short, redacted description of an error for the audit log. PayPal errors keep their name and debug id. */
-function describe(err: unknown, client: PayPalClient): string {
-  if (err instanceof PayPalApiError) {
-    const issues = err.details.map((d) => d.issue).filter((i): i is string => typeof i === 'string');
-    return client.redactor.redact(`PayPal ${err.status} ${err.paypalName}${issues.length > 0 ? ` [${issues.join(', ')}]` : ''}${err.debugId ? ` debug_id=${err.debugId}` : ''}`);
-  }
-  return client.redactor.redact(err instanceof Error ? `${err.name}: ${err.message}` : String(err));
 }

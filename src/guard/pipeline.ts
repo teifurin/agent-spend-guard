@@ -5,6 +5,8 @@
  *
  * Composition rules (DECISIONS D9): ALLOW -> AUTO_APPROVE, HOLD -> HOLD, BLOCK -> BLOCK; the reviewer can move a
  * decision only to the right (AUTO_APPROVE -> HOLD -> BLOCK); a reviewer failure or timeout means HOLD.
+ * The policy runs twice: before the reviewer and again after it, because a review takes seconds and the rules, the
+ * budget or the clock may have moved meanwhile; the tighter of the two policy verdicts counts (D16).
  * The reviewer is a plug-in: M1 ships a passthrough, M3 adds the LLM-backed one.
  */
 import type { NewRequest, Repo } from '../db/repo.js';
@@ -32,7 +34,7 @@ export interface ReviewOutcome {
 
 export type Reviewer = (input: ReviewInput, signal: AbortSignal) => Promise<ReviewOutcome>;
 
-/** Default when no reviewer is wired in (tests, e2e:sandbox): no AI, never tightens. The server always wires one (src/review). */
+/** Default when no reviewer is wired in (unit tests): no AI, never tightens. The server and the e2e runs always wire one (src/review). */
 export const passthroughReviewer: Reviewer = async () => ({
   risk: 'low',
   flags: [],
@@ -63,7 +65,7 @@ export interface GuardResult {
   decision: Decision;
   policy: PolicyResult;
   review: ReviewOutcome | null;
-  /** Present when the request was charged (COMPLETED or FAILED). */
+  /** Present when a charge was attempted: COMPLETED, FAILED, or still CREATED when PayPal never confirmed the outcome (D16). */
   payment: Payment | null;
 }
 
@@ -101,25 +103,40 @@ export class Guard {
     if (!request) throw new Error(`unknown request "${requestId}"`);
     if (request.status !== 'EVALUATING') throw new Error(`request "${requestId}" is ${request.status}; it was already decided`);
 
-    const agent = this.repo.getAgent(request.agentId);
+    // Rules, budget and clock are read fresh each time this runs: once now, once more after the reviewer.
+    const evaluateNow = (): PolicyResult =>
+      evaluatePolicy({
+        agent: this.repo.getAgent(request.agentId),
+        policy: this.repo.getPolicy(request.agentId),
+        request,
+        context: this.repo.policyContext(request.agentId, this.now(), request.id),
+      });
     const policy = this.repo.getPolicy(request.agentId);
-    const context = this.repo.policyContext(request.agentId, this.now());
-    const policyResult = evaluatePolicy({ agent, policy, request, context });
-    const policyFinal = finalFromVerdict(policyResult.verdict);
+    let policyResult = evaluateNow();
+    let policyFinal = finalFromVerdict(policyResult.verdict);
 
-    let final = policyFinal;
     let review: ReviewOutcome | null = null;
     let reviewFailure: string | undefined;
+    let reviewerSays: FinalDecision = 'AUTO_APPROVE'; // adds nothing when the reviewer does not run (BLOCK)
     if (policyResult.verdict !== 'BLOCK') {
       try {
         review = await this.runReviewer({ request, policy, policyVerdict: policyResult.verdict, policyReasons: policyResult.reasons, budget: policyResult.budget });
-        final = tighter(policyFinal, review.recommendation);
+        reviewerSays = review.recommendation;
       } catch (err) {
         // Short and secret-free: this text reaches the dashboard, the audit log and the agent.
         reviewFailure = clampText(err instanceof Error ? err.message : String(err), 300);
-        final = tighter(policyFinal, 'HOLD');
+        reviewerSays = 'HOLD';
+      }
+      // The review took time. A rule the owner tightened meanwhile, a sibling request decided first, or the allowed
+      // hours ending all count: evaluate again and keep the tighter policy verdict, never the looser one (D9, D16).
+      const again = evaluateNow();
+      const againFinal = finalFromVerdict(again.verdict);
+      if (RANK[againFinal] >= RANK[policyFinal]) {
+        policyResult = again;
+        policyFinal = againFinal;
       }
     }
+    const final = tighter(policyFinal, reviewerSays);
 
     const decision = this.repo.transaction(() => {
       const recorded = this.repo.recordDecision({
@@ -160,6 +177,21 @@ export class Guard {
     this.transition(requestId, 'HELD', 'APPROVED', actor, 'owner.approved');
     const payment = this.executor ? await this.executor.charge(requestId) : null;
     return { request: this.requireRequest(requestId), payment };
+  }
+
+  /**
+   * The owner retries a charge PayPal never confirmed: the payment is still CREATED and the request still approved
+   * (D16). The executor looks the recorded order up, or repeats the create under the same idempotency key, so a retry
+   * cannot charge twice (D8).
+   */
+  async retryCharge(requestId: string, actor: string = 'owner'): Promise<Payment> {
+    if (!this.executor) throw new Error('retrying a payment needs PayPal credentials (the guard runs keyless)');
+    const request = this.requireRequest(requestId);
+    if (request.status !== 'AUTO_APPROVED' && request.status !== 'APPROVED') {
+      throw new Error(`request "${requestId}" is ${request.status}; only an approved request with an unsettled payment can be retried`);
+    }
+    this.repo.appendAudit({ actor, action: 'payment.retried', requestId, agentId: request.agentId, details: {} });
+    return this.executor.charge(requestId);
   }
 
   /** The owner denies a HELD request. */
