@@ -34,7 +34,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+      # Use the CLI directly: the action's push range asks for the root commit's
+      # nonexistent parent on a first push, and otherwise scans only the push.
+      - name: Install Gitleaks
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_VERSION: 8.24.3
+          GITLEAKS_SHA256: 9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tool_dir="$(mktemp -d)"
+          curl --fail --silent --show-error --location --retry 3 \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}" \
+            --output "${tool_dir}/${archive}"
+          printf '%s  %s\n' "$GITLEAKS_SHA256" "${tool_dir}/${archive}" | sha256sum --check --strict
+          tar -xzf "${tool_dir}/${archive}" -C "$tool_dir" gitleaks
+          echo "$tool_dir" >> "$GITHUB_PATH"
+      - name: Scan full Git history
+        run: gitleaks git --log-opts=--all --redact --no-banner --config .gitleaks.toml
