@@ -34,7 +34,7 @@ Without a PayPal account, which is also what CI runs (Node 22, at least 22.13, o
 
 ```bash
 npm ci
-npm test               # 24 files, 312 tests; PayPal and the model are fakes, no network
+npm test               # 24 files, 315 tests; PayPal and the model are fakes, no network
 npm run e2e:offline    # the four scenarios, charge and refund included, against a fake PayPal
                        # ends with: VERDICT: 4/4 scenarios as expected, 2/2 refunds completed.
 npm run dev            # dashboard on http://localhost:3000, keyless: decisions only, nothing charged
