@@ -2,7 +2,7 @@
 
 **A payment guardrail between AI agents and PayPal.** Agents never get a wallet, a card or an API key. They get one tool, `request_purchase`. The guard checks each request against the owner's rules, has an AI reviewer look for anything fishy, and only then charges PayPal. Anything outside the rules waits for a human tap. Everything is logged, and any payment can be refunded from the dashboard.
 
-> Status: **M0–M4** done (2026-10-28), **M5** in progress. Policy engine, decision pipeline and PayPal executor ([D11](docs/DECISIONS.md)); MCP server, mock shopping agent, synthetic shop and owner dashboard with live updates ([D12](docs/DECISIONS.md)); the AI risk reviewer with a mock mode and an Anthropic mode, the injected request ending in BLOCK, price anomalies, a phone-sized dashboard ([D13](docs/DECISIONS.md)); one end-to-end run that plays all four scenarios on the sandbox or, without an account, against a fake PayPal, reproduced from a fresh clone, CI on Node 22 and 24 ([D14](docs/DECISIONS.md)). The whole loop has run against the sandbox: a request auto-paid through the mandate, a held one approved and paid from the dashboard, an injected one stopped. M5 (2026-10-30): the demo video is recorded, and the Anthropic reviewer has been run against the live API on the sandbox end-to-end run, 4/4 ([D15](docs/DECISIONS.md)); an external security review led to the fixes in [D16](docs/DECISIONS.md) (payments PayPal never confirmed stay counted, budget accounting under concurrency, cross-site protections for the dashboard, a tighter redaction boundary). Next: the Devpost submission. PayPal AI Hackathon 2026 entry.
+> Status: **M0–M4** done (2026-10-28), **M5** in progress. Policy engine, decision pipeline and PayPal executor ([D11](docs/DECISIONS.md)); MCP server, mock shopping agent, synthetic shop and owner dashboard with live updates ([D12](docs/DECISIONS.md)); the AI risk reviewer with a mock mode and an Anthropic mode, the injected request ending in BLOCK, price anomalies, a phone-sized dashboard ([D13](docs/DECISIONS.md)); one end-to-end run that plays all four scenarios on the sandbox or, without an account, against a fake PayPal, reproduced from a fresh clone, CI on Node 22 and 24 ([D14](docs/DECISIONS.md)). The whole loop has run against the sandbox: a request auto-paid through the mandate, a held one approved and paid from the dashboard, an injected one stopped. M5 (2026-10-30): the demo video is recorded, and the Anthropic reviewer has been run against the live API on the sandbox end-to-end run, 4/4 ([D15](docs/DECISIONS.md)); an external security review led to the fixes in [D16](docs/DECISIONS.md) (payments PayPal never confirmed stay counted, budget accounting under concurrency, cross-site protections for the dashboard, a tighter redaction boundary); a second review (2026-11-01) to those in [D17](docs/DECISIONS.md) (transient PayPal errors and failed lookups stay unsettled, an `intent_id` so a retried purchase cannot pay twice, the hard rules checked again at approval, pending refunds counted until confirmed, interrupted reviews recovered at start-up). Next: the Devpost submission. PayPal AI Hackathon 2026 entry.
 > Runs against the PayPal **sandbox only**. Every merchant, product and price in the demo is **synthetic**.
 
 ## The problem
@@ -34,7 +34,7 @@ Without a PayPal account, which is also what CI runs (Node 22.13 or newer):
 
 ```bash
 npm ci
-npm test               # 23 files, 258 tests; PayPal and the model are fakes, no network
+npm test               # 23 files, 279 tests; PayPal and the model are fakes, no network
 npm run e2e:offline    # the four scenarios, charge and refund included, against a fake PayPal
                        # ends with: VERDICT: 4/4 scenarios as expected, 2/2 refunds completed.
 npm run dev            # dashboard on http://localhost:3000, keyless: decisions only, nothing charged
@@ -86,7 +86,7 @@ npm run dev           # dashboard + agent API on http://localhost:3000, syntheti
 npm run demo:agent    # second terminal: the mock shopping agent plays four scenarios through MCP
 ```
 
-The agent browses the shop, then asks the guard to pay through the MCP tools (`request_purchase`, `get_request_status`, `get_budget`):
+The agent browses the shop, then asks the guard to pay through the MCP tools (`request_purchase`, with an optional `intent_id` so that a call repeated after a lost answer returns the same request instead of opening a second one; `get_request_status`; `get_budget`):
 
 | Scenario | What the agent does | What the guard does |
 | --- | --- | --- |
@@ -133,8 +133,8 @@ The design, the flag vocabulary and why the model cannot loosen anything: [D13](
 - The reviewer's page fetch is the only request the guard makes to a URL an agent chose: http(s) only, allowlisted origins, no redirects, size and time caps, the body released on every early return (tested). The model, when there is one, gets untrusted text inside marked sections it cannot close, returns a schema-bound verdict, and can only tighten; known provider errors are reduced to fixed phrases and any other one is redacted and clipped before it is stored, so a key never ends up in the database or in an agent's tool result (tested).
 - The vault id lives only in the database (`data/guard.db`, gitignored together with its `-wal`/`-shm` files) and in `.spike-state.json`. The executor registers it with the redactor before every PayPal call; audit entries carry PayPal object ids (setup token ids masked), the guard's own ids, amounts, statuses and your notes, never a token; tests assert the vault id appears nowhere visible.
 - The PayPal client redacts bearer tokens, basic-auth values, the configured credentials and the vault id from every field of every error it raises, redacting before it truncates; a connection, read or parse failure becomes an error with fixed text; redirects are never followed (tested).
-- `PayPal-Request-Id` is derived from our own request ids, so a retry of the same request cannot double-charge (tested); a new `request_purchase` is a new request. When PayPal never confirms a charge (no connection, a 5xx, a `PENDING` capture), the payment stays open and counted against the budget until you retry it from the dashboard, which replays the same keys ([D16](docs/DECISIONS.md), tested).
-- Budget accounting holds under concurrency: requests submitted together are counted against each other first come first served while they are being reviewed, and the rules are checked again after the review, so a cap you tighten meanwhile or the allowed hours ending still count ([D16](docs/DECISIONS.md), tested).
+- `PayPal-Request-Id` is derived from our own request ids, so a retry of the same request cannot double-charge (tested); a `request_purchase` repeated with the same `intent_id` returns the request already made instead of opening a second one, and the same id with a different purchase is refused ([D17](docs/DECISIONS.md), tested). When PayPal never confirms a charge (no connection, a 5xx, a 401/403/429, a `PENDING` capture, or any error while looking a recorded order up), the payment stays open and counted against the budget until you retry it from the dashboard, which replays the same keys ([D16](docs/DECISIONS.md), [D17](docs/DECISIONS.md), tested). A refund PayPal answers `PENDING` stays counted until **Check refund** finds it completed ([D17](docs/DECISIONS.md), tested).
+- Budget accounting holds under concurrency: requests submitted together are counted against each other first come first served while they are being reviewed, and the rules are checked again after the review, so a cap you tighten meanwhile or the allowed hours ending still count ([D16](docs/DECISIONS.md), tested). Approving a held request checks the hard rules again (a disabled agent, the hard ceiling) and refuses when they say no, and a request a restart interrupted during its review is held for you at the next start instead of hanging and counting ([D17](docs/DECISIONS.md), tested).
 - `.githooks/pre-commit` (installed by `npm install` through the `prepare` script, which sets this repository's `core.hooksPath` and nothing else) refuses `.env*`, database files and anything under `data/`, and runs [gitleaks](https://github.com/gitleaks/gitleaks) when installed; CI runs gitleaks over the full history with a read-only token. `npm run e2e:offline` never reads `.env`; its PayPal credentials are placeholders for a fake that answers in-process.
 
 ## Layout
@@ -145,7 +145,7 @@ src/
   config/  .env loading (Node's built-in parser, nothing is ever printed)
   domain/  types, money (integer minor units), name normalization
   policy/  deterministic engine, reason codes with severities, time-zone helpers, policy validation
-  db/      node:sqlite connection, migrations/001_init.sql, Repo (agents, policies, requests, decisions, payments, mandates, audit)
+  db/      node:sqlite connection, migrations/001–003, Repo (agents, policies, requests, decisions, payments, mandates, audit)
   paypal/  sandbox-only REST client, redaction, Orders v2 / Payments v2 calls, vault (setup and payment tokens)
   guard/   decision pipeline (policy -> reviewer -> decision -> charge), PayPal executor
   review/  the AI reviewer: evidence (price history, fenced page fetch), flag vocabulary, rule-based checks, mock and Anthropic implementations
@@ -158,7 +158,7 @@ tests/     Vitest tests (PayPal and the LLM provider are fake fetches; the MCP s
 docs/      HANDOFF.md (the original plan, historical), RESEARCH.md (sources, historical), DECISIONS.md, THREAT_MODEL.md
 ```
 
-How the guard decides and pays is written down in [docs/DECISIONS.md](docs/DECISIONS.md) (D9: HOLD vs BLOCK, D10: budget accounting, D11: the executor, D12: the M2 topology, D13: the reviewer, D14: the end-to-end run, D16: the security review and what it changed).
+How the guard decides and pays is written down in [docs/DECISIONS.md](docs/DECISIONS.md) (D9: HOLD vs BLOCK, D10: budget accounting, D11: the executor, D12: the M2 topology, D13: the reviewer, D14: the end-to-end run, D16: the security review and what it changed, D17: the second review: intent ids, pending refunds, recovery after a restart).
 
 Coming next: the Devpost submission; the demo video (2:40, narrated, the reviewer in mock mode on screen) is recorded. Not built: an AG Grid audit table (plain HTML for now, see D13), push notifications, webhooks, a real-LLM mode for the shopping agent (the agent is the mock; the reviewer is where the model goes).
 
