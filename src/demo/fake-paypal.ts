@@ -45,6 +45,8 @@ export function createFakePayPal(): FakePayPal {
     if (method === 'POST' && /^\/v2\/payments\/captures\/[^/]+\/refund$/.test(path)) {
       return json({ id: nextId('REFUND'), status: 'COMPLETED' }, 201);
     }
+    const refund = /^\/v2\/payments\/refunds\/([^/]+)$/.exec(path);
+    if (method === 'GET' && refund) return json({ id: decodeURIComponent(refund[1] ?? ''), status: 'COMPLETED' }, 200);
     return json({ name: 'RESOURCE_NOT_FOUND', message: `the offline fake does not implement ${method} ${path}`, details: [] }, 404);
   };
   return { fetch: fetchImpl as unknown as typeof fetch, calls };

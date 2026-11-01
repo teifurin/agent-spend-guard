@@ -90,6 +90,12 @@ export async function captureOrder(client: PayPalClient, requestId: string, orde
   return data;
 }
 
+/** Payments v2: where a refund PayPal answered PENDING for has got to (COMPLETED, PENDING, CANCELLED or FAILED). */
+export async function getRefund(client: PayPalClient, refundId: string): Promise<PayPalRefund> {
+  const { data } = await client.request<PayPalRefund>('GET', `/v2/payments/refunds/${encodeURIComponent(refundId)}`);
+  return data;
+}
+
 export async function refundCapture(client: PayPalClient, requestId: string, captureId: string): Promise<PayPalRefund> {
   const { data } = await client.request<PayPalRefund>('POST', `/v2/payments/captures/${encodeURIComponent(captureId)}/refund`, {
     body: {},

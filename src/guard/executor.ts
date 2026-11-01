@@ -4,15 +4,17 @@
  *
  * State changes follow D10: the payment row and the request status change together, in one transaction, and
  * PayPal is only ever called outside a transaction. A rejection by PayPal is recorded (PAYMENT_FAILED), not thrown.
- * An outcome PayPal never confirmed (no connection, an unreadable answer, a 5xx, a PENDING capture) is left open:
- * the payment stays CREATED, the request stays approved and the amount keeps counting against the budget until the
- * owner retries and the idempotent replay finds out what happened (D16). Programming errors are thrown.
+ * An outcome PayPal never confirmed (no connection, an unreadable answer, a 5xx, a 401/403/429, a PENDING capture, any
+ * error while looking a recorded order up) is left open: the payment stays CREATED, the request stays approved and the
+ * amount keeps counting against the budget until the owner retries and the idempotent replay finds out what happened
+ * (D16, D17). A refund PayPal answers PENDING is REFUND_PENDING, still counted, until a check confirms it (D17).
+ * Programming errors are thrown.
  */
 import type { Repo } from '../db/repo.js';
 import type { Payment } from '../domain/types.js';
 import { PayPalApiError, type PayPalClient } from '../paypal/client.js';
 import { describePayPalError } from '../paypal/errors.js';
-import { captureOf, captureOrder, createVaultOrder, getOrder, type PayPalCapture, type PayPalOrder, refundCapture } from '../paypal/orders.js';
+import { captureOf, captureOrder, createVaultOrder, getOrder, getRefund, type PayPalCapture, type PayPalOrder, refundCapture } from '../paypal/orders.js';
 
 export interface ExecutorDeps {
   client: PayPalClient;
@@ -37,8 +39,15 @@ interface Stop {
   reason: string;
 }
 
-/** PayPal processed the call and refused it: a 4xx. Anything else (5xx, no connection, unreadable answer) leaves the outcome open. */
-const isFinalRejection = (err: unknown): boolean => err instanceof PayPalApiError && err.status >= 400 && err.status < 500;
+/**
+ * Statuses that say the call did not get through, not that PayPal refused the charge: an expired or wrong token (401,
+ * after the client's own retry), a permission problem (403), a timeout (408), rate limiting (429). They leave the
+ * outcome open like a 5xx does, for the owner's retry (D17).
+ */
+const TRANSIENT_STATUSES = new Set([401, 403, 408, 429]);
+
+/** PayPal processed the call and refused it: any other 4xx. Everything else (5xx, no connection, unreadable answer) leaves the outcome open. */
+const isFinalRejection = (err: unknown): boolean => err instanceof PayPalApiError && err.status >= 400 && err.status < 500 && !TRANSIENT_STATUSES.has(err.status);
 
 export class PayPalExecutor {
   private readonly client: PayPalClient;
@@ -89,10 +98,15 @@ export class PayPalExecutor {
     let orderId: string | null = payment.paypalOrderId;
     let capture: PayPalCapture | undefined;
     let stop: Stop | undefined;
+    // While a recorded order is being looked up, no answer can prove that the earlier charge did not happen: an error
+    // there, 4xx included, is an unknown outcome, never a rejection (D17).
+    let lookingUp = false;
     try {
       let order: PayPalOrder;
       if (orderId) {
+        lookingUp = true;
         order = await getOrder(this.client, orderId); // resume or retry: the order exists, find out how far it got
+        lookingUp = false;
       } else {
         order = await createVaultOrder(this.client, request, mandate.paypalVaultId);
         orderId = order.id;
@@ -116,7 +130,7 @@ export class PayPalExecutor {
         stop = { kind: refused ? 'failed' : 'unsettled', reason: `capture ${capture.id} is ${capture.status}` };
       }
     } catch (err) {
-      stop = { kind: isFinalRejection(err) ? 'failed' : 'unsettled', reason: describePayPalError(err, this.client) };
+      stop = { kind: !lookingUp && isFinalRejection(err) ? 'failed' : 'unsettled', reason: describePayPalError(err, this.client) };
     }
     if (stop === undefined && !capture) stop = { kind: 'unsettled', reason: 'no capture object in the answer' };
 
@@ -149,30 +163,81 @@ export class PayPalExecutor {
     return settled;
   }
 
-  /** Refunds a PAID request's capture in full and returns the payment as REFUNDED (request REFUNDED). */
+  /**
+   * Refunds a PAID request's capture in full. Returns the payment as REFUNDED (request REFUNDED) when PayPal completes
+   * the refund at once, or as REFUND_PENDING, still counted against the budget, when PayPal answers PENDING; the owner
+   * then confirms it with checkRefund (D17).
+   */
   async refund(requestId: string): Promise<Payment> {
     const request = this.repo.getRequest(requestId);
     if (!request) throw new ExecutorError(`unknown request "${requestId}"`);
     const payment = this.repo.paymentForRequest(requestId);
     if (!payment) throw new ExecutorError(`request "${requestId}" has no payment`);
     if (payment.status === 'REFUNDED') return payment;
+    if (payment.status === 'REFUND_PENDING') {
+      throw new ExecutorError(`refund ${payment.paypalRefundId ?? '?'} is still pending with PayPal; check it instead of refunding again`);
+    }
     if (payment.status !== 'COMPLETED' || !payment.paypalCaptureId) {
       throw new ExecutorError(`payment "${payment.id}" is ${payment.status}; only a completed capture can be refunded`);
     }
 
     let refundId: string;
+    let pending: boolean;
     try {
       const refund = await refundCapture(this.client, request.id, payment.paypalCaptureId);
       if (refund.status !== 'COMPLETED' && refund.status !== 'PENDING') throw new ExecutorError(`refund ${refund.id} is ${refund.status}`);
       refundId = refund.id;
+      pending = refund.status === 'PENDING';
     } catch (err) {
       const reason = describePayPalError(err, this.client);
       this.audit('refund.failed', request.id, request.agentId, { paymentId: payment.id, paypalCaptureId: payment.paypalCaptureId, reason });
       throw err instanceof ExecutorError ? err : new ExecutorError(`refund failed: ${reason}`);
     }
 
+    if (pending) {
+      const open = this.repo.markRefundPending(payment.id, refundId);
+      this.audit('refund.pending', request.id, request.agentId, { paymentId: payment.id, paypalCaptureId: payment.paypalCaptureId, paypalRefundId: refundId });
+      this.log(`payment ${payment.id} REFUND_PENDING refund ${refundId}: the amount stays counted until PayPal completes it`);
+      return open;
+    }
+    return this.settleRefund(request.id, request.agentId, payment, refundId);
+  }
+
+  /**
+   * Asks PayPal how a PENDING refund got on (the owner's "Check refund"). COMPLETED settles it: payment and request
+   * REFUNDED, budget given back. CANCELLED or FAILED hands the capture back: COMPLETED again, refundable anew. PENDING,
+   * or an error from PayPal, changes nothing (D17).
+   */
+  async checkRefund(requestId: string): Promise<Payment> {
+    const request = this.repo.getRequest(requestId);
+    if (!request) throw new ExecutorError(`unknown request "${requestId}"`);
+    const payment = this.repo.paymentForRequest(requestId);
+    if (!payment) throw new ExecutorError(`request "${requestId}" has no payment`);
+    if (payment.status === 'REFUNDED') return payment;
+    if (payment.status !== 'REFUND_PENDING' || !payment.paypalRefundId) {
+      throw new ExecutorError(`payment "${payment.id}" is ${payment.status}; only a pending refund can be checked`);
+    }
+
+    let status: string;
+    try {
+      status = (await getRefund(this.client, payment.paypalRefundId)).status;
+    } catch (err) {
+      throw new ExecutorError(`could not check refund ${payment.paypalRefundId}: ${describePayPalError(err, this.client)}`);
+    }
+    this.log(`refund ${payment.paypalRefundId} ${status}`);
+    if (status === 'COMPLETED') return this.settleRefund(request.id, request.agentId, payment, payment.paypalRefundId);
+    if (status === 'CANCELLED' || status === 'FAILED') {
+      const restored = this.repo.cancelPendingRefund(payment.id);
+      this.audit('refund.failed', request.id, request.agentId, { paymentId: payment.id, paypalCaptureId: payment.paypalCaptureId, paypalRefundId: payment.paypalRefundId, reason: `refund ${payment.paypalRefundId} is ${status}` });
+      this.log(`payment ${payment.id} back to COMPLETED: refund ${payment.paypalRefundId} ${status}`);
+      return restored;
+    }
+    return payment; // PENDING, or a status this code does not know: nothing to book yet
+  }
+
+  private settleRefund(requestId: string, agentId: string, payment: Payment, refundId: string): Payment {
     const refunded = this.repo.refundPayment(payment.id, refundId);
-    this.audit('payment.refunded', request.id, request.agentId, { paymentId: payment.id, paypalCaptureId: payment.paypalCaptureId, paypalRefundId: refundId });
+    this.audit('payment.refunded', requestId, agentId, { paymentId: payment.id, paypalCaptureId: payment.paypalCaptureId, paypalRefundId: refundId });
     this.log(`payment ${payment.id} REFUNDED refund ${refundId}`);
     return refunded;
   }

@@ -38,6 +38,8 @@ export interface NewRequest {
   currency: string;
   reason: string;
   sourceUrl?: string | null;
+  /** Caller-chosen idempotency key, unique per agent (D17). */
+  intentId?: string | null;
 }
 
 export interface NewDecision {
@@ -94,6 +96,8 @@ export interface PaymentOutcome {
 const IN_FLIGHT_SQL = `('AUTO_APPROVED', 'APPROVED')`;
 /** A merchant is "known" to an agent once a request to it was paid, refunded later or not. */
 const PAID_SQL = `('PAID', 'REFUNDED')`;
+/** Captures that count as spent: completed, or with a refund PayPal has not completed yet (D17). */
+const SPENT_SQL = `('COMPLETED', 'REFUND_PENDING')`;
 
 const newId = (prefix: string): string => `${prefix}_${randomBytes(6).toString('hex')}`;
 const str = (v: unknown): string => String(v);
@@ -211,14 +215,15 @@ export class Repo {
       currency: input.currency,
       reason: input.reason,
       sourceUrl: input.sourceUrl ?? null,
+      intentId: input.intentId ?? null,
       status: 'EVALUATING',
       createdAt: ts,
       updatedAt: ts,
     };
     this.db
       .prepare(
-        `INSERT INTO requests (id, agent_id, merchant, merchant_key, item, category, amount_minor, currency, reason, source_url, status, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO requests (id, agent_id, merchant, merchant_key, item, category, amount_minor, currency, reason, source_url, intent_id, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         request.id,
@@ -231,6 +236,7 @@ export class Repo {
         request.currency,
         request.reason,
         request.sourceUrl,
+        request.intentId,
         request.status,
         request.createdAt,
         request.updatedAt,
@@ -241,6 +247,20 @@ export class Repo {
   getRequest(id: string): PurchaseRequest | undefined {
     const row = this.db.prepare('SELECT * FROM requests WHERE id = ?').get(id);
     return row ? toRequest(row) : undefined;
+  }
+
+  /** The request this agent already made under this intent id, if any (D17). */
+  requestByIntent(agentId: string, intentId: string): PurchaseRequest | undefined {
+    const row = this.db.prepare('SELECT * FROM requests WHERE agent_id = ? AND intent_id = ?').get(agentId, intentId);
+    return row ? toRequest(row) : undefined;
+  }
+
+  /** Requests still EVALUATING, oldest first: after a restart, the ones the previous process never finished deciding (D17). */
+  evaluatingRequests(): PurchaseRequest[] {
+    return this.db
+      .prepare(`SELECT * FROM requests WHERE status = 'EVALUATING' ORDER BY rowid ASC`)
+      .all()
+      .map((row) => toRequest(row as Row));
   }
 
   setRequestStatus(id: string, status: RequestStatus): PurchaseRequest {
@@ -477,10 +497,34 @@ export class Repo {
   refundPayment(paymentId: string, paypalRefundId: string): Payment {
     return this.transaction(() => {
       const payment = this.requirePayment(paymentId);
-      if (payment.status !== 'COMPLETED') throw new Error(`payment "${paymentId}" is ${payment.status}; only COMPLETED payments can be refunded`);
+      if (payment.status !== 'COMPLETED' && payment.status !== 'REFUND_PENDING') {
+        throw new Error(`payment "${paymentId}" is ${payment.status}; only COMPLETED or REFUND_PENDING payments can be refunded`);
+      }
       const updated = this.updatePayment(paymentId, { paypalRefundId, status: 'REFUNDED' });
       this.setRequestStatus(payment.requestId, 'REFUNDED');
       return updated;
+    });
+  }
+
+  /**
+   * PayPal accepted the refund but answered PENDING: the payment is REFUND_PENDING and keeps counting against the
+   * budget; the request stays PAID until PayPal completes the refund (D17).
+   */
+  markRefundPending(paymentId: string, paypalRefundId: string): Payment {
+    return this.transaction(() => {
+      const payment = this.requirePayment(paymentId);
+      if (payment.status === 'REFUND_PENDING' && payment.paypalRefundId === paypalRefundId) return payment;
+      if (payment.status !== 'COMPLETED') throw new Error(`payment "${paymentId}" is ${payment.status}; only COMPLETED payments can have a pending refund`);
+      return this.updatePayment(paymentId, { paypalRefundId, status: 'REFUND_PENDING' });
+    });
+  }
+
+  /** PayPal cancelled or failed a pending refund: the capture stands again, COMPLETED, and can be refunded anew (D17). */
+  cancelPendingRefund(paymentId: string): Payment {
+    return this.transaction(() => {
+      const payment = this.requirePayment(paymentId);
+      if (payment.status !== 'REFUND_PENDING') throw new Error(`payment "${paymentId}" is ${payment.status}; only a REFUND_PENDING payment can lose its refund`);
+      return this.updatePayment(paymentId, { paypalRefundId: null, status: 'COMPLETED' });
     });
   }
 
@@ -494,7 +538,8 @@ export class Repo {
 
   /**
    * Spend that counts against the agent's budget for the month containing nowMs in the given zone:
-   * completed captures in that month plus approved requests not yet captured. Refunded captures do not count.
+   * completed captures in that month plus approved requests not yet captured. Refunded captures do not count; a
+   * capture whose refund PayPal has not completed yet (REFUND_PENDING) still does (D17).
    *
    * While a request is being decided (`deciding` = its id), the agent's older requests that are still EVALUATING count
    * too, first come first served: of two requests submitted at the same moment, the older one sees a free budget and
@@ -503,7 +548,7 @@ export class Repo {
   spentThisMonthMinor(agentId: string, nowMs: number, timezone: string, deciding?: string): number {
     const { startMs, endMs } = monthBounds(nowMs, timezone);
     const captured = this.db
-      .prepare(`SELECT COALESCE(SUM(amount_minor), 0) AS total FROM payments WHERE agent_id = ? AND status = 'COMPLETED' AND captured_at >= ? AND captured_at < ?`)
+      .prepare(`SELECT COALESCE(SUM(amount_minor), 0) AS total FROM payments WHERE agent_id = ? AND status IN ${SPENT_SQL} AND captured_at >= ? AND captured_at < ?`)
       .get(agentId, startMs, endMs);
     const inFlight = this.db
       .prepare(
@@ -521,6 +566,17 @@ export class Repo {
       .prepare(
         `SELECT r.* FROM requests r JOIN payments p ON p.request_id = r.id
          WHERE p.status = 'CREATED' AND r.status IN ${IN_FLIGHT_SQL} ORDER BY r.created_at ASC, r.id ASC`,
+      )
+      .all()
+      .map((row) => toRequest(row as Row));
+  }
+
+  /** Paid requests whose refund PayPal accepted but has not completed: payment REFUND_PENDING, amount still counted (D17). */
+  refundPendingRequests(): PurchaseRequest[] {
+    return this.db
+      .prepare(
+        `SELECT r.* FROM requests r JOIN payments p ON p.request_id = r.id
+         WHERE p.status = 'REFUND_PENDING' ORDER BY r.created_at ASC, r.id ASC`,
       )
       .all()
       .map((row) => toRequest(row as Row));
@@ -600,6 +656,7 @@ function toRequest(row: Row): PurchaseRequest {
     currency: str(row['currency']),
     reason: str(row['reason']),
     sourceUrl: strOrNull(row['source_url']),
+    intentId: strOrNull(row['intent_id']),
     status: str(row['status']) as RequestStatus,
     createdAt: num(row['created_at']),
     updatedAt: num(row['updated_at']),

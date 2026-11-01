@@ -18,6 +18,7 @@ function request(over: Partial<PurchaseRequest> = {}): PurchaseRequest {
     currency: 'USD',
     reason: 'Field notes for the survey; this is the notebook the team uses.',
     sourceUrl: 'http://localhost:3001/products/field-notebook-a5',
+    intentId: null,
     status: 'EVALUATING',
     createdAt: NOW,
     updatedAt: NOW,

@@ -237,3 +237,99 @@ describe('PayPalExecutor.refund', () => {
     await expect(executor.refund(request.id)).rejects.toThrow('has no payment');
   });
 });
+
+describe('what counts as PayPal refusing (D17)', () => {
+  it('leaves a charge unsettled when the lookup of a recorded order fails, 4xx included, and settles it on the next retry', async () => {
+    const { repo, executor, request, calls } = setup((_call, n) => (n === 1 ? json({ name: 'RATE_LIMIT_REACHED', message: 'slow down', debug_id: 'd429' }, 429) : completedOrder('O11', 'C11')));
+    const started = repo.beginPayment(request.id);
+    repo.updatePayment(started.id, { paypalOrderId: 'O11' });
+
+    const first = await executor.charge(request.id);
+    expect(first.status).toBe('CREATED');
+    expect(repo.getRequest(request.id)?.status).toBe('AUTO_APPROVED');
+    expect(repo.spentThisMonthMinor('research-bot', NOW, 'Asia/Tokyo')).toBe(1200);
+    expect(repo.listAudit({ requestId: request.id }).find((a) => a.action === 'payment.unsettled')?.details['reason']).toBe('PayPal 429 RATE_LIMIT_REACHED debug_id=d429');
+
+    const second = await executor.charge(request.id);
+    expect(second.status).toBe('COMPLETED');
+    expect(repo.getRequest(request.id)?.status).toBe('PAID');
+    expect(calls.map((c) => `${c.method} ${c.url.replace(PAYPAL_SANDBOX_BASE_URL, '')}`)).toEqual(['GET /v2/checkout/orders/O11', 'GET /v2/checkout/orders/O11']);
+  });
+
+  it('treats 401, 403 and 429 on the charge itself as unsettled, and any other 4xx as PayPal refusing', async () => {
+    for (const [status, name] of [
+      [401, 'UNAUTHORIZED'],
+      [403, 'NOT_AUTHORIZED'],
+      [429, 'RATE_LIMIT_REACHED'],
+    ] as const) {
+      const open = setup(() => json({ name, message: 'no', debug_id: `d${status}` }, status));
+      expect((await open.executor.charge(open.request.id)).status, `${status}`).toBe('CREATED');
+      expect(open.repo.getRequest(open.request.id)?.status, `${status}`).toBe('AUTO_APPROVED');
+      expect(open.repo.listAudit({ requestId: open.request.id }).find((a) => a.action === 'payment.unsettled')?.details['reason']).toBe(`PayPal ${status} ${name} debug_id=d${status}`);
+    }
+    const refused = setup(() => json({ name: 'INVALID_REQUEST', message: 'bad', debug_id: 'd400' }, 400));
+    expect((await refused.executor.charge(refused.request.id)).status).toBe('FAILED');
+    expect(refused.repo.getRequest(refused.request.id)?.status).toBe('PAYMENT_FAILED');
+  });
+});
+
+describe('refunds PayPal does not complete at once (D17)', () => {
+  it('keeps a PENDING refund counted until PayPal completes it, and refuses a second refund meanwhile', async () => {
+    let checks = 0;
+    const { repo, executor, request, calls } = setup((call) => {
+      if (call.url.endsWith('/refund')) return json({ id: 'R2', status: 'PENDING' }, 201);
+      if (call.url.includes('/v2/payments/refunds/R2')) return json({ id: 'R2', status: ++checks === 1 ? 'PENDING' : 'COMPLETED' }, 200);
+      return completedOrder('O12', 'C12');
+    });
+    await executor.charge(request.id);
+    const pending = await executor.refund(request.id);
+    expect(pending).toMatchObject({ status: 'REFUND_PENDING', paypalRefundId: 'R2' });
+    expect(repo.getRequest(request.id)?.status).toBe('PAID');
+    expect(repo.spentThisMonthMinor('research-bot', NOW, 'Asia/Tokyo')).toBe(1200);
+    expect(repo.refundPendingRequests().map((r) => r.id)).toEqual([request.id]);
+    expect(repo.listAudit({ requestId: request.id })[0]?.action).toBe('refund.pending');
+    await expect(executor.refund(request.id)).rejects.toThrow('still pending');
+
+    expect((await executor.checkRefund(request.id)).status).toBe('REFUND_PENDING');
+    const done = await executor.checkRefund(request.id);
+    expect(done).toMatchObject({ status: 'REFUNDED', paypalRefundId: 'R2' });
+    expect(repo.getRequest(request.id)?.status).toBe('REFUNDED');
+    expect(repo.spentThisMonthMinor('research-bot', NOW, 'Asia/Tokyo')).toBe(0);
+    expect(repo.listAudit({ requestId: request.id })[0]?.action).toBe('payment.refunded');
+    expect(calls.map((c) => `${c.method} ${c.url.replace(PAYPAL_SANDBOX_BASE_URL, '')}`)).toEqual([
+      'POST /v2/checkout/orders',
+      'POST /v2/payments/captures/C12/refund',
+      'GET /v2/payments/refunds/R2',
+      'GET /v2/payments/refunds/R2',
+    ]);
+    expect(await executor.checkRefund(request.id)).toEqual(done);
+  });
+
+  it('hands the capture back when PayPal cancels a pending refund, so it can be refunded again', async () => {
+    const { repo, executor, request } = setup((call) => {
+      if (call.url.endsWith('/refund')) return json({ id: 'R3', status: 'PENDING' }, 201);
+      if (call.url.includes('/v2/payments/refunds/R3')) return json({ id: 'R3', status: 'CANCELLED' }, 200);
+      return completedOrder('O13', 'C13');
+    });
+    await executor.charge(request.id);
+    await executor.refund(request.id);
+    const restored = await executor.checkRefund(request.id);
+    expect(restored).toMatchObject({ status: 'COMPLETED', paypalRefundId: null, paypalCaptureId: 'C13' });
+    expect(repo.getRequest(request.id)?.status).toBe('PAID');
+    expect(repo.spentThisMonthMinor('research-bot', NOW, 'Asia/Tokyo')).toBe(1200);
+    expect(repo.listAudit({ requestId: request.id })[0]).toMatchObject({ action: 'refund.failed', details: { paypalRefundId: 'R3', reason: 'refund R3 is CANCELLED' } });
+    await expect(executor.checkRefund(request.id)).rejects.toThrow('only a pending refund can be checked');
+  });
+
+  it('changes nothing when the refund check itself fails', async () => {
+    const { repo, executor, request } = setup((call) => {
+      if (call.url.endsWith('/refund')) return json({ id: 'R4', status: 'PENDING' }, 201);
+      if (call.url.includes('/v2/payments/refunds/R4')) return json({ name: 'INTERNAL_SERVER_ERROR', message: 'later', debug_id: 'd50' }, 503);
+      return completedOrder('O14', 'C14');
+    });
+    await executor.charge(request.id);
+    await executor.refund(request.id);
+    await expect(executor.checkRefund(request.id)).rejects.toThrow('could not check refund R4: PayPal 503 INTERNAL_SERVER_ERROR debug_id=d50');
+    expect(repo.paymentForRequest(request.id)?.status).toBe('REFUND_PENDING');
+  });
+});

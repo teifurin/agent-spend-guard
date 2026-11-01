@@ -74,6 +74,10 @@ if (process.exitCode !== 1 && review) {
   const events = new EventBus();
   const executor = paypal ? new PayPalExecutor({ client: paypal, repo, log: (line) => console.log(`executor: ${line}`) }) : undefined;
   const guard = new Guard({ repo, executor, reviewer: review.reviewer, reviewTimeoutMs });
+  // Before the first request can arrive: requests a previous run left under review are held for the owner, so they
+  // neither hang forever nor keep counting against the budget of the requests that follow (D17).
+  const recovered = await guard.recoverInterrupted();
+  if (recovered.length > 0) console.log(`recovered ${recovered.length} request(s) the previous run left under review: ${recovered.map((r) => `${r.request.id} ${r.request.status}`).join(', ')}`);
   const app = createApp({ repo, guard, events, executor, paypal, publicBaseUrl, shopUrl, reviewer: { label: review.label, mock: review.mock } });
   const shop = createShopApp();
 

@@ -67,6 +67,8 @@ export interface PurchaseRequest {
   /** The agent's stated reason, treated as untrusted text. */
   reason: string;
   sourceUrl: string | null;
+  /** The agent's own id for this purchase, unique per agent; a repeat with the same id returns this request (D17). */
+  intentId: string | null;
   status: RequestStatus;
   createdAt: number;
   updatedAt: number;
@@ -94,7 +96,8 @@ export interface Decision {
   decidedAt: number;
 }
 
-export const PAYMENT_STATUSES = ['CREATED', 'COMPLETED', 'FAILED', 'REFUNDED'] as const;
+/** REFUND_PENDING: PayPal took the refund but has not completed it; the capture still counts against the budget (D17). */
+export const PAYMENT_STATUSES = ['CREATED', 'COMPLETED', 'FAILED', 'REFUND_PENDING', 'REFUNDED'] as const;
 export type PaymentStatus = (typeof PAYMENT_STATUSES)[number];
 
 /** One PayPal charge for one request. ids are PayPal object ids, never tokens. */

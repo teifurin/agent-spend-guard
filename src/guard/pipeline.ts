@@ -6,13 +6,16 @@
  * Composition rules (DECISIONS D9): ALLOW -> AUTO_APPROVE, HOLD -> HOLD, BLOCK -> BLOCK; the reviewer can move a
  * decision only to the right (AUTO_APPROVE -> HOLD -> BLOCK); a reviewer failure or timeout means HOLD.
  * The policy runs twice: before the reviewer and again after it, because a review takes seconds and the rules, the
- * budget or the clock may have moved meanwhile; the tighter of the two policy verdicts counts (D16).
+ * budget or the clock may have moved meanwhile; the tighter of the two policy verdicts counts (D16). It runs once more
+ * when the owner approves a held request, and a BLOCK-level rule refuses the approval (D17).
+ * A request repeated under the same intent id is answered with the request already made, never a second one (D17).
  * The reviewer is a plug-in: M1 ships a passthrough, M3 adds the LLM-backed one.
  */
 import type { NewRequest, Repo } from '../db/repo.js';
+import { normalizeName } from '../domain/normalize.js';
 import type { Decision, FinalDecision, Payment, Policy, PolicyReason, PurchaseRequest, RequestStatus, ReviewRisk } from '../domain/types.js';
 import { type BudgetSnapshot, evaluatePolicy, type PolicyResult } from '../policy/engine.js';
-import type { PolicyVerdict } from '../policy/reasons.js';
+import { type PolicyVerdict, severityOf } from '../policy/reasons.js';
 import { clampText } from '../review/text.js';
 import type { PayPalExecutor } from './executor.js';
 
@@ -42,6 +45,11 @@ export const passthroughReviewer: Reviewer = async () => ({
   recommendation: 'AUTO_APPROVE',
 });
 
+/** Stands in for the reviewer when a request is recovered after a restart: its review never finished, so it holds (D17). */
+const interruptedReviewer: Reviewer = async () => {
+  throw new Error('the guard restarted while this request was under review');
+};
+
 const RANK: Record<FinalDecision, number> = { AUTO_APPROVE: 0, HOLD: 1, BLOCK: 2 };
 const STATUS_FOR: Record<FinalDecision, RequestStatus> = { AUTO_APPROVE: 'AUTO_APPROVED', HOLD: 'HELD', BLOCK: 'BLOCKED' };
 
@@ -49,6 +57,36 @@ const STATUS_FOR: Record<FinalDecision, RequestStatus> = { AUTO_APPROVE: 'AUTO_A
 export const tighter = (a: FinalDecision, b: FinalDecision): FinalDecision => (RANK[a] >= RANK[b] ? a : b);
 
 export const finalFromVerdict = (verdict: PolicyVerdict): FinalDecision => (verdict === 'ALLOW' ? 'AUTO_APPROVE' : verdict === 'HOLD' ? 'HOLD' : 'BLOCK');
+
+/** A repeated request_purchase whose intent id already names a different purchase (D17). */
+export class IntentConflictError extends Error {
+  constructor(
+    readonly existing: PurchaseRequest,
+    readonly differences: string[],
+  ) {
+    super(`intent_id "${existing.intentId ?? ''}" already names request ${existing.id}, with a different ${differences.join(', ')}; use a new intent_id for a new purchase`);
+    this.name = 'IntentConflictError';
+  }
+}
+
+/** The owner tried to approve a held request that a BLOCK-level rule now forbids (D17). */
+export class ApprovalRefusedError extends Error {
+  constructor(readonly reasons: PolicyReason[]) {
+    super(`cannot approve: ${reasons.map((r) => r.message).join('; ')}. Fix the rule, or deny the request.`);
+    this.name = 'ApprovalRefusedError';
+  }
+}
+
+/** Which of the fields that define a purchase differ between a stored request and a repeat of it. */
+function intentDifferences(existing: PurchaseRequest, input: NewRequest): string[] {
+  const differences: string[] = [];
+  if (normalizeName(input.merchant) !== existing.merchantKey) differences.push('merchant');
+  if (input.item !== existing.item) differences.push('item');
+  if (normalizeName(input.category) !== normalizeName(existing.category)) differences.push('category');
+  if (input.amountMinor !== existing.amountMinor) differences.push('amount');
+  if (input.currency !== existing.currency) differences.push('currency');
+  return differences;
+}
 
 export interface GuardDeps {
   repo: Repo;
@@ -61,6 +99,7 @@ export interface GuardDeps {
 }
 
 export interface GuardResult {
+  replayed: false;
   request: PurchaseRequest;
   decision: Decision;
   policy: PolicyResult;
@@ -68,6 +107,17 @@ export interface GuardResult {
   /** Present when a charge was attempted: COMPLETED, FAILED, or still CREATED when PayPal never confirmed the outcome (D16). */
   payment: Payment | null;
 }
+
+/** A request submitted again under the intent id of one already made: that request as it stands, nothing new decided (D17). */
+export interface ReplayResult {
+  replayed: true;
+  request: PurchaseRequest;
+  /** null while the first submission is still being decided. */
+  decision: Decision | null;
+  payment: Payment | null;
+}
+
+export type SubmitResult = GuardResult | ReplayResult;
 
 export class Guard {
   private readonly repo: Repo;
@@ -84,33 +134,77 @@ export class Guard {
     this.now = deps.now ?? Date.now;
   }
 
-  /** What the MCP tool calls: records the request, decides it and (with an executor) charges it when auto-approved. */
-  async submit(input: NewRequest, actor: string = `agent:${input.agentId}`): Promise<GuardResult> {
+  /**
+   * What the MCP tool calls: records the request, decides it and (with an executor) charges it when auto-approved.
+   * With an intent id the agent already used, nothing new is made: the request it names comes back as it stands
+   * (`replayed: true`), or, when the repeat describes a different purchase, an IntentConflictError (D17). Without an
+   * intent id the result is always a fresh decision.
+   */
+  submit(input: NewRequest & { intentId?: null | undefined }, actor?: string): Promise<GuardResult>;
+  submit(input: NewRequest, actor?: string): Promise<SubmitResult>;
+  async submit(input: NewRequest, actor: string = `agent:${input.agentId}`): Promise<SubmitResult> {
+    const intentId = input.intentId ?? null;
+    if (intentId !== null) {
+      // Lookup and insert are both synchronous: within this process nothing can slip in between them.
+      const existing = this.repo.requestByIntent(input.agentId, intentId);
+      if (existing) {
+        const differences = intentDifferences(existing, input);
+        if (differences.length > 0) {
+          this.repo.appendAudit({ actor, action: 'request.intent_conflict', requestId: existing.id, agentId: existing.agentId, details: { intentId, differences } });
+          throw new IntentConflictError(existing, differences);
+        }
+        this.repo.appendAudit({ actor, action: 'request.replayed', requestId: existing.id, agentId: existing.agentId, details: { intentId } });
+        return { replayed: true, request: existing, decision: this.repo.latestDecision(existing.id) ?? null, payment: this.repo.paymentForRequest(existing.id) ?? null };
+      }
+    }
     const request = this.repo.createRequest(input);
     this.repo.appendAudit({
       actor,
       action: 'request.created',
       requestId: request.id,
       agentId: request.agentId,
-      details: { merchant: request.merchant, item: request.item, category: request.category, amountMinor: request.amountMinor, currency: request.currency },
+      details: { merchant: request.merchant, item: request.item, category: request.category, amountMinor: request.amountMinor, currency: request.currency, ...(intentId === null ? {} : { intentId }) },
     });
     return this.decide(request.id);
   }
 
   /** Decides an EVALUATING request. */
   async decide(requestId: string): Promise<GuardResult> {
+    return this.decideWith(requestId, this.reviewer);
+  }
+
+  /**
+   * Called once at start-up. Requests the previous process left EVALUATING (it died or was stopped during a review)
+   * are decided now, oldest first, with the rules of this moment and a reviewer that reports the interruption: each
+   * ends HELD for the owner (BLOCKED when the rules say so), nothing is charged, and none keeps counting as an older
+   * sibling in the budget of the requests that follow (D17).
+   */
+  async recoverInterrupted(actor: string = 'system'): Promise<GuardResult[]> {
+    const results: GuardResult[] = [];
+    for (const request of this.repo.evaluatingRequests()) {
+      this.repo.appendAudit({ actor, action: 'request.recovered', requestId: request.id, agentId: request.agentId, details: { reason: 'the guard restarted while this request was under review' } });
+      results.push(await this.decideWith(request.id, interruptedReviewer));
+    }
+    return results;
+  }
+
+  /** The rules, budget and clock as they stand right now, for this request. */
+  private evaluate(request: PurchaseRequest): PolicyResult {
+    return evaluatePolicy({
+      agent: this.repo.getAgent(request.agentId),
+      policy: this.repo.getPolicy(request.agentId),
+      request,
+      context: this.repo.policyContext(request.agentId, this.now(), request.id),
+    });
+  }
+
+  private async decideWith(requestId: string, reviewer: Reviewer): Promise<GuardResult> {
     const request = this.repo.getRequest(requestId);
     if (!request) throw new Error(`unknown request "${requestId}"`);
     if (request.status !== 'EVALUATING') throw new Error(`request "${requestId}" is ${request.status}; it was already decided`);
 
     // Rules, budget and clock are read fresh each time this runs: once now, once more after the reviewer.
-    const evaluateNow = (): PolicyResult =>
-      evaluatePolicy({
-        agent: this.repo.getAgent(request.agentId),
-        policy: this.repo.getPolicy(request.agentId),
-        request,
-        context: this.repo.policyContext(request.agentId, this.now(), request.id),
-      });
+    const evaluateNow = (): PolicyResult => this.evaluate(request);
     const policy = this.repo.getPolicy(request.agentId);
     let policyResult = evaluateNow();
     let policyFinal = finalFromVerdict(policyResult.verdict);
@@ -120,7 +214,7 @@ export class Guard {
     let reviewerSays: FinalDecision = 'AUTO_APPROVE'; // adds nothing when the reviewer does not run (BLOCK)
     if (policyResult.verdict !== 'BLOCK') {
       try {
-        review = await this.runReviewer({ request, policy, policyVerdict: policyResult.verdict, policyReasons: policyResult.reasons, budget: policyResult.budget });
+        review = await this.runReviewer(reviewer, { request, policy, policyVerdict: policyResult.verdict, policyReasons: policyResult.reasons, budget: policyResult.budget });
         reviewerSays = review.recommendation;
       } catch (err) {
         // Short and secret-free: this text reaches the dashboard, the audit log and the agent.
@@ -169,12 +263,30 @@ export class Guard {
 
     let payment: Payment | null = null;
     if (final === 'AUTO_APPROVE' && this.executor) payment = await this.executor.charge(requestId);
-    return { request: this.requireRequest(requestId), decision, policy: policyResult, review, payment };
+    return { replayed: false, request: this.requireRequest(requestId), decision, policy: policyResult, review, payment };
   }
 
-  /** The owner approves a HELD request; with an executor it is charged right away. */
+  /**
+   * The owner approves a HELD request; with an executor it is charged right away. The rules run once more first: the
+   * soft ones (cap, budget, merchant, category, hours) are the owner's to override, which is what a hold is for, but a
+   * BLOCK-level fact that appeared since the hold (the agent disabled, the hard ceiling lowered below the amount, the
+   * policy gone) refuses the approval, and the request stays HELD for the owner to fix the rule or deny it (D17).
+   */
   async approve(requestId: string, actor: string = 'owner'): Promise<{ request: PurchaseRequest; payment: Payment | null }> {
-    this.transition(requestId, 'HELD', 'APPROVED', actor, 'owner.approved');
+    const refused = this.repo.transaction(() => {
+      const request = this.requireRequest(requestId);
+      if (request.status !== 'HELD') throw new Error(`request "${requestId}" is ${request.status}, not HELD`);
+      const hard = this.evaluate(request).reasons.filter((r) => severityOf(r.code) === 'BLOCK');
+      if (hard.length > 0) return { request, hard };
+      this.repo.setRequestStatus(requestId, 'APPROVED');
+      this.repo.appendAudit({ actor, action: 'owner.approved', requestId, agentId: request.agentId, details: {} });
+      return undefined;
+    });
+    if (refused) {
+      // Written outside the transaction above, so the refusal stays on record.
+      this.repo.appendAudit({ actor, action: 'owner.approve_refused', requestId, agentId: refused.request.agentId, details: { reasons: refused.hard.map((r) => r.code) } });
+      throw new ApprovalRefusedError(refused.hard);
+    }
     const payment = this.executor ? await this.executor.charge(requestId) : null;
     return { request: this.requireRequest(requestId), payment };
   }
@@ -215,7 +327,7 @@ export class Guard {
     return request;
   }
 
-  private async runReviewer(input: ReviewInput): Promise<ReviewOutcome> {
+  private async runReviewer(reviewer: Reviewer, input: ReviewInput): Promise<ReviewOutcome> {
     const ac = new AbortController();
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<never>((_, reject) => {
@@ -225,7 +337,7 @@ export class Guard {
       }, this.reviewTimeoutMs);
     });
     try {
-      return await Promise.race([this.reviewer(input, ac.signal), timeout]);
+      return await Promise.race([reviewer(input, ac.signal), timeout]);
     } finally {
       if (timer) clearTimeout(timer);
     }

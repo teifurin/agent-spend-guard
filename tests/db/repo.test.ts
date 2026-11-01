@@ -1,5 +1,6 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { migrate, openDatabase } from '../../src/db/connection.js';
@@ -334,12 +335,83 @@ describe('payment state changes (D10)', () => {
   it('refundPayment marks the request REFUNDED, gives the budget back and rejects anything not completed', () => {
     const { repo, request } = approved();
     const payment = repo.beginPayment(request.id);
-    expect(() => repo.refundPayment(payment.id, 'R0')).toThrow('only COMPLETED payments can be refunded');
+    expect(() => repo.refundPayment(payment.id, 'R0')).toThrow('only COMPLETED or REFUND_PENDING payments can be refunded');
     repo.settlePayment(payment.id, { paypalOrderId: 'O3', paypalCaptureId: 'C3', capturedAt: OCT_27_NOON_JST });
     const refunded = repo.refundPayment(payment.id, 'R3');
     expect(refunded).toMatchObject({ status: 'REFUNDED', paypalRefundId: 'R3' });
     expect(repo.getRequest(request.id)?.status).toBe('REFUNDED');
     expect(repo.spentThisMonthMinor('research-bot', OCT_27_NOON_JST, 'Asia/Tokyo')).toBe(0);
     expect(repo.knownMerchants('research-bot')).toEqual(['synthetic books']);
+  });
+
+  it('markRefundPending keeps the amount counted; refundPayment settles it; cancelPendingRefund hands the capture back (D17)', () => {
+    const { repo, request } = approved();
+    const payment = repo.beginPayment(request.id);
+    expect(() => repo.markRefundPending(payment.id, 'R4')).toThrow('only COMPLETED payments can have a pending refund');
+    repo.settlePayment(payment.id, { paypalOrderId: 'O4', paypalCaptureId: 'C4', capturedAt: OCT_27_NOON_JST });
+    const pending = repo.markRefundPending(payment.id, 'R4');
+    expect(pending).toMatchObject({ status: 'REFUND_PENDING', paypalRefundId: 'R4' });
+    expect(repo.getRequest(request.id)?.status).toBe('PAID');
+    expect(repo.spentThisMonthMinor('research-bot', OCT_27_NOON_JST, 'Asia/Tokyo')).toBe(1200);
+    expect(repo.refundPendingRequests().map((r) => r.id)).toEqual([request.id]);
+    expect(repo.markRefundPending(payment.id, 'R4')).toEqual(pending);
+
+    const restored = repo.cancelPendingRefund(payment.id);
+    expect(restored).toMatchObject({ status: 'COMPLETED', paypalRefundId: null, paypalCaptureId: 'C4' });
+    expect(repo.refundPendingRequests()).toEqual([]);
+    expect(() => repo.cancelPendingRefund(payment.id)).toThrow('only a REFUND_PENDING payment');
+
+    repo.markRefundPending(payment.id, 'R5');
+    const refunded = repo.refundPayment(payment.id, 'R5');
+    expect(refunded).toMatchObject({ status: 'REFUNDED', paypalRefundId: 'R5' });
+    expect(repo.getRequest(request.id)?.status).toBe('REFUNDED');
+    expect(repo.spentThisMonthMinor('research-bot', OCT_27_NOON_JST, 'Asia/Tokyo')).toBe(0);
+  });
+});
+
+describe('schema changes since 001 (D17)', () => {
+  it('migrate a database created by 001 with its rows intact', () => {
+    const db = new DatabaseSync(':memory:');
+    db.exec('PRAGMA foreign_keys = ON');
+    db.exec('CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)');
+    db.exec(readFileSync(new URL('../../src/db/migrations/001_init.sql', import.meta.url), 'utf8'));
+    db.prepare('INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)').run('001_init.sql', 1);
+    db.exec(`INSERT INTO agents (id, name, status, created_at) VALUES ('a', 'A', 'active', 1)`);
+    db.exec(`INSERT INTO requests (id, agent_id, merchant, merchant_key, item, category, amount_minor, currency, reason, status, created_at, updated_at)
+             VALUES ('r1', 'a', 'M', 'm', 'I', 'c', 1200, 'USD', 'why', 'PAID', 1, 1)`);
+    db.exec(`INSERT INTO payments (id, request_id, agent_id, paypal_order_id, paypal_capture_id, amount_minor, currency, status, captured_at, created_at, updated_at)
+             VALUES ('p1', 'r1', 'a', 'O1', 'C1', 1200, 'USD', 'COMPLETED', 1, 1, 1)`);
+
+    expect(migrate(db)).toEqual(['002_intent_id.sql', '003_refund_pending.sql']);
+    const repo = new Repo(db, () => 2);
+    expect(repo.getRequest('r1')).toMatchObject({ id: 'r1', intentId: null, status: 'PAID' });
+    expect(repo.getPayment('p1')).toMatchObject({ id: 'p1', requestId: 'r1', paypalCaptureId: 'C1', status: 'COMPLETED' });
+    expect(repo.markRefundPending('p1', 'R1').status).toBe('REFUND_PENDING'); // the widened CHECK accepts it
+    expect(repo.spentThisMonthMinor('a', 1, 'UTC')).toBe(1200);
+    const indexes = db
+      .prepare(`SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('requests_agent_intent', 'payments_agent_captured') ORDER BY name`)
+      .all()
+      .map((r) => r['name']);
+    expect(indexes).toEqual(['payments_agent_captured', 'requests_agent_intent']);
+    expect(migrate(db)).toEqual([]);
+  });
+
+  it('finds a request by agent and intent id, and refuses a second request under the same one', () => {
+    const { repo } = setup();
+    const first = repo.createRequest({ ...baseRequest, intentId: 'i-1' });
+    expect(repo.requestByIntent('research-bot', 'i-1')?.id).toBe(first.id);
+    expect(repo.requestByIntent('research-bot', 'i-2')).toBeUndefined();
+    expect(() => repo.createRequest({ ...baseRequest, intentId: 'i-1' })).toThrow(/UNIQUE/);
+    expect(repo.createRequest(baseRequest).intentId).toBeNull();
+    expect(repo.createRequest(baseRequest).intentId).toBeNull(); // no intent id twice is fine: the index skips nulls
+  });
+
+  it('lists EVALUATING requests oldest first', () => {
+    const { repo } = setup();
+    const a = repo.createRequest(baseRequest);
+    const b = repo.createRequest(baseRequest);
+    const c = repo.createRequest(baseRequest);
+    repo.setRequestStatus(b.id, 'HELD');
+    expect(repo.evaluatingRequests().map((r) => r.id)).toEqual([a.id, c.id]);
   });
 });

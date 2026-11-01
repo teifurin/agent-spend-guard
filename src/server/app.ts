@@ -13,7 +13,7 @@ import type { Repo } from '../db/repo.js';
 import { formatAmount, parseAmount } from '../domain/money.js';
 import type { Agent, AuditEntry, Decision, Mandate, Payment, Policy, PurchaseRequest, RequestStatus } from '../domain/types.js';
 import type { PayPalExecutor } from '../guard/executor.js';
-import type { Guard } from '../guard/pipeline.js';
+import { type Guard, IntentConflictError } from '../guard/pipeline.js';
 import type { PayPalClient } from '../paypal/client.js';
 import { describePayPalError } from '../paypal/errors.js';
 import { mask } from '../paypal/redact.js';
@@ -52,6 +52,14 @@ const requestSchema = z.object({
   currency: z.string().length(3),
   reason: z.string().max(2000),
   source_url: z.string().max(2000).nullable().optional(),
+  // The agent's idempotency key (D17): a repeat under the same id returns the request already made.
+  intent_id: z
+    .string()
+    .min(1)
+    .max(64)
+    .regex(/^[A-Za-z0-9._:-]+$/, 'letters, digits and . _ : - only')
+    .nullable()
+    .optional(),
 });
 
 function toMinor(amount: string | number): number | undefined {
@@ -101,6 +109,8 @@ export function hostAllowed(requestUrl: string, publicBaseUrl: string): boolean 
 
 /** The event a finished charge publishes: CREATED means PayPal never confirmed the outcome (D16). */
 const paymentEvent = (payment: Payment): string => (payment.status === 'COMPLETED' ? 'payment.captured' : payment.status === 'CREATED' ? 'payment.unsettled' : 'payment.failed');
+/** The event a refund step publishes: COMPLETED means PayPal gave the capture back after a pending refund failed (D17). */
+const refundEvent = (payment: Payment): string => (payment.status === 'REFUNDED' ? 'payment.refunded' : payment.status === 'REFUND_PENDING' ? 'refund.pending' : 'refund.failed');
 
 /** An approved request whose charge stopped without PayPal's answer: payment row still CREATED. */
 const isUnsettled = (request: PurchaseRequest, payment: Payment | undefined): boolean =>
@@ -142,6 +152,7 @@ export function requestView(repo: Repo, request: PurchaseRequest) {
     currency: request.currency,
     reason: request.reason,
     source_url: request.sourceUrl,
+    intent_id: request.intentId,
     created_at: new Date(request.createdAt).toISOString(),
     decision: decision
       ? {
@@ -153,7 +164,7 @@ export function requestView(repo: Repo, request: PurchaseRequest) {
         }
       : null,
     payment: payment ? { status: payment.status, paypal_order_id: payment.paypalOrderId, paypal_capture_id: payment.paypalCaptureId, paypal_refund_id: payment.paypalRefundId } : null,
-    message: `${MESSAGES[request.status]}${isUnsettled(request, payment) ? ' PayPal has not confirmed the charge yet; the owner will settle it. Do not retry the purchase.' : ''}${reasons.length > 0 ? ` Reasons: ${reasons.map((r) => r.message).join('; ')}.` : ''}${reviewMessage}`,
+    message: `${MESSAGES[request.status]}${isUnsettled(request, payment) ? ' PayPal has not confirmed the charge yet; the owner will settle it. Do not retry the purchase.' : ''}${payment?.status === 'REFUND_PENDING' ? ' A refund is pending with PayPal; the amount still counts until it completes.' : ''}${reasons.length > 0 ? ` Reasons: ${reasons.map((r) => r.message).join('; ')}.` : ''}${reviewMessage}`,
   };
 }
 
@@ -439,6 +450,7 @@ export function createApp(deps: AppDeps): Hono {
     const agents = repo.listAgents();
     const held = repo.listRequests({ status: 'HELD', limit: 50 });
     const unsettled = repo.unsettledRequests();
+    const refundPending = repo.refundPendingRequests();
     const recent = repo.listRequests({ limit: 20 });
     const mandate = repo.activeMandate();
     const body = html`<h1>Overview</h1>
@@ -462,6 +474,11 @@ ${unsettled.length === 0 ? '' : html`<h2>Payments to settle (${unsettled.length}
 ${unsettled.map((r) => html`<div class="card">
   <div class="actions"><strong>${money(r.amountMinor, r.currency)}</strong> at <strong class="wrap">${r.merchant}</strong> <span class="muted">by ${r.agentId}</span> ${badge(r.status)}</div>
   <div class="muted">PayPal did not confirm this charge. The amount still counts against the budget. <a href="/requests/${r.id}">Open and retry</a></div>
+</div>`)}`}
+${refundPending.length === 0 ? '' : html`<h2>Refunds to confirm (${refundPending.length})</h2>
+${refundPending.map((r) => html`<div class="card">
+  <div class="actions"><strong>${money(r.amountMinor, r.currency)}</strong> at <strong class="wrap">${r.merchant}</strong> <span class="muted">by ${r.agentId}</span> ${badge(r.status)}</div>
+  <div class="muted">PayPal has not completed this refund yet. The amount still counts against the budget. <a href="/requests/${r.id}">Open and check</a></div>
 </div>`)}`}
 <h2>Waiting for you (${held.length})</h2>
 ${held.length === 0 ? html`<p class="muted">Nothing is waiting.</p>` : ''}
@@ -499,9 +516,11 @@ ${requestTable(
     const notice = c.req.query('notice');
     const unsettled = isUnsettled(request, payment);
     const unsettledReason = unsettled ? newestFirst.find((a) => a.action === 'payment.unsettled')?.details['reason'] : undefined;
+    const refundPending = payment?.status === 'REFUND_PENDING';
     const body = html`<h1>Request <span class="mono">${request.id}</span> ${badge(request.status)}</h1>
 ${notice ? html`<div class="notice">${notice}</div>` : ''}
 ${unsettled ? html`<div class="error"><strong>Payment outcome unknown.</strong> ${typeof unsettledReason === 'string' ? html`${unsettledReason}. ` : ''}PayPal may or may not have charged this; the amount stays counted against the budget until it is settled. Retrying looks the order up first and cannot charge twice.</div>` : ''}
+${refundPending ? html`<div class="notice"><strong>Refund pending.</strong> PayPal accepted refund <span class="mono">${payment?.paypalRefundId ?? '?'}</span> but has not completed it; the amount stays counted against the budget until it does. Check it to find out.</div>` : ''}
 <div class="card">
 <table>
 <tr><th>Agent</th><td>${request.agentId}</td></tr>
@@ -516,7 +535,8 @@ ${unsettled ? html`<div class="error"><strong>Payment outcome unknown.</strong> 
 </div>
 <div class="actions decide">
 ${request.status === 'HELD' ? html`<form method="post" action="/requests/${request.id}/approve"><button type="submit">Approve &amp; pay</button></form><form method="post" action="/requests/${request.id}/deny"><input type="hidden" name="note" value=""><button type="submit" class="deny">Deny</button></form>` : ''}
-${request.status === 'PAID' && executor ? html`<form method="post" action="/requests/${request.id}/refund"><button type="submit" class="ghost">Refund</button></form>` : ''}
+${request.status === 'PAID' && payment?.status === 'COMPLETED' && executor ? html`<form method="post" action="/requests/${request.id}/refund"><button type="submit" class="ghost">Refund</button></form>` : ''}
+${refundPending && executor ? html`<form method="post" action="/requests/${request.id}/refund-check"><button type="submit">Check refund</button></form>` : ''}
 ${unsettled && executor ? html`<form method="post" action="/requests/${request.id}/charge"><button type="submit">Retry payment</button></form>` : ''}
 </div>
 <h2>Decision</h2>
@@ -589,10 +609,34 @@ ${unsettled && executor ? html`<form method="post" action="/requests/${request.i
       const payment = await withLock(id, () => executor.refund(id));
       if (!payment) return inProgress(c, id);
       const request = repo.getRequest(id);
-      if (request) publishRequest('payment.refunded', request);
-      return c.redirect(`/requests/${id}?notice=${encodeURIComponent(`Refunded (refund ${payment.paypalRefundId ?? '?'}).`)}`, 303);
+      if (request) publishRequest(refundEvent(payment), request);
+      const notice =
+        payment.status === 'REFUNDED'
+          ? `Refunded (refund ${payment.paypalRefundId ?? '?'}).`
+          : `PayPal accepted refund ${payment.paypalRefundId ?? '?'} but has not completed it; the amount stays counted until you check it and PayPal says COMPLETED.`;
+      return c.redirect(`/requests/${id}?notice=${encodeURIComponent(notice)}`, 303);
     } catch (err) {
       return c.html(page('Error', html`<h1>Could not refund</h1><div class="error">${err instanceof Error ? err.message : String(err)}</div><p><a href="/requests/${id}">Back</a></p>`), 409);
+    }
+  });
+
+  app.post('/requests/:id/refund-check', async (c) => {
+    const id = c.req.param('id');
+    if (!executor) return c.html(page('Error', html`<h1>Checking a refund needs PayPal credentials</h1>`), 503);
+    try {
+      const payment = await withLock(id, () => executor.checkRefund(id));
+      if (!payment) return inProgress(c, id);
+      const request = repo.getRequest(id);
+      if (request && payment.status !== 'REFUND_PENDING') publishRequest(refundEvent(payment), request);
+      const notice =
+        payment.status === 'REFUNDED'
+          ? `Refunded (refund ${payment.paypalRefundId ?? '?'}); the budget has it back.`
+          : payment.status === 'REFUND_PENDING'
+            ? 'Still pending with PayPal; the amount stays counted. Check again later.'
+            : 'PayPal did not complete the refund. The capture stands, counts as before, and can be refunded again.';
+      return c.redirect(`/requests/${id}?notice=${encodeURIComponent(notice)}`, 303);
+    } catch (err) {
+      return c.html(page('Error', html`<h1>Could not check the refund</h1><div class="error">${err instanceof Error ? err.message : String(err)}</div><p><a href="/requests/${id}">Back</a></p>`), 409);
     }
   });
 
@@ -775,16 +819,26 @@ ${mandates.length === 0 ? '' : html`<h2>Mandates</h2><div class="card"><table><t
     if (amountMinor === undefined) return c.json({ error: 'invalid_request', issues: ['amount: must be a positive amount with two decimals, like 12.00'] }, 400);
     if (!repo.getAgent(input.agent_id)) return c.json({ error: 'unknown_agent', message: `No agent "${input.agent_id}" is registered with this guard.` }, 404);
 
-    const result = await guard.submit({
-      agentId: input.agent_id,
-      merchant: input.merchant,
-      item: input.item,
-      category: input.category,
-      amountMinor,
-      currency: input.currency.toUpperCase(),
-      reason: input.reason,
-      sourceUrl: input.source_url ?? null,
-    });
+    let result;
+    try {
+      result = await guard.submit({
+        agentId: input.agent_id,
+        merchant: input.merchant,
+        item: input.item,
+        category: input.category,
+        amountMinor,
+        currency: input.currency.toUpperCase(),
+        reason: input.reason,
+        sourceUrl: input.source_url ?? null,
+        intentId: input.intent_id ?? null,
+      });
+    } catch (err) {
+      // The same intent id with a different purchase behind it: nothing is made, the agent needs a new id (D17).
+      if (err instanceof IntentConflictError) return c.json({ error: 'intent_conflict', message: err.message, request_id: err.existing.id }, 409);
+      throw err;
+    }
+    // A repeat under a known intent id changes nothing, so it publishes nothing and answers 200, not 201.
+    if (result.replayed) return c.json({ ...requestView(repo, result.request), replayed: true }, 200);
     publishRequest('request.decided', result.request);
     if (result.payment) publishRequest(paymentEvent(result.payment), result.request);
     return c.json(requestView(repo, result.request), 201);

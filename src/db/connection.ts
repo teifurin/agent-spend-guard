@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { DatabaseSync } from 'node:sqlite';
 
 /** Migrations run in this order, once each; the file name is the key in schema_migrations. */
-const MIGRATIONS = ['001_init.sql'] as const;
+const MIGRATIONS = ['001_init.sql', '002_intent_id.sql', '003_refund_pending.sql'] as const;
 
 /**
  * Opens (or creates) the SQLite database and brings its schema up to date.

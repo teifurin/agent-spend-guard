@@ -21,6 +21,10 @@ class FakeExecutor {
   /** When set, refunds wait on it: lets a test hold one owner action while another arrives. */
   public hold: Promise<void> | null = null;
   public refundsStarted = 0;
+  /** What PayPal answers a refund with: COMPLETED at once, or PENDING until a check says otherwise (D17). */
+  public refundOutcome: 'COMPLETED' | 'PENDING' = 'COMPLETED';
+  /** What a refund check finds. */
+  public refundCheck: 'COMPLETED' | 'PENDING' | 'CANCELLED' = 'COMPLETED';
   constructor(
     private readonly repo: Repo,
     public outcome: 'COMPLETED' | 'FAILED' | 'UNSETTLED' = 'COMPLETED',
@@ -40,7 +44,15 @@ class FakeExecutor {
     if (this.hold) await this.hold;
     const payment = this.repo.paymentForRequest(requestId);
     if (!payment) throw new Error('no payment');
-    return this.repo.refundPayment(payment.id, 'R-fake');
+    if (payment.status === 'REFUND_PENDING') throw new Error('refund R-fake is still pending with PayPal; check it instead of refunding again');
+    return this.refundOutcome === 'PENDING' ? this.repo.markRefundPending(payment.id, 'R-fake') : this.repo.refundPayment(payment.id, 'R-fake');
+  }
+  async checkRefund(requestId: string): Promise<Payment> {
+    const payment = this.repo.paymentForRequest(requestId);
+    if (!payment || payment.status !== 'REFUND_PENDING') throw new Error('only a pending refund can be checked');
+    if (this.refundCheck === 'COMPLETED') return this.repo.refundPayment(payment.id, 'R-fake');
+    if (this.refundCheck === 'CANCELLED') return this.repo.cancelPendingRefund(payment.id);
+    return payment;
   }
 }
 
@@ -514,5 +526,81 @@ describe('PayPal link flow', () => {
     expect(text).toContain('Could not start the link: PayPal 403');
     expect(text).toContain('PERMISSION_DENIED');
     expect(text).not.toContain(SECRET);
+  });
+});
+
+describe('intent ids (D17)', () => {
+  it('answers a repeated request_purchase with the request already made: 200, replayed, nothing charged twice', async () => {
+    const { app, repo, published } = setup();
+    const first = await postJson(app, '/api/requests', { ...notebook, intent_id: 'nb-0001' });
+    expect(first.status).toBe(201);
+    const made = (await first.json()) as ApiRequest & { intent_id: string | null };
+    expect(made.intent_id).toBe('nb-0001');
+    const again = await postJson(app, '/api/requests', { ...notebook, intent_id: 'nb-0001' });
+    expect(again.status).toBe(200);
+    expect((await again.json()) as ApiRequest & { replayed?: boolean }).toMatchObject({ request_id: made.request_id, status: 'PAID', replayed: true });
+    expect(repo.listRequests({ agentId: DEMO_AGENT_ID }).length).toBe(1);
+    expect(published.map((e) => e.type)).toEqual(['request.decided', 'payment.captured']); // the replay publishes nothing
+    expect(repo.spentThisMonthMinor(DEMO_AGENT_ID, NOW, 'Asia/Tokyo')).toBe(1200);
+  });
+
+  it('refuses the same intent id for a different purchase, and malformed ids before the guard sees them', async () => {
+    const { app, repo } = setup();
+    const made = (await (await postJson(app, '/api/requests', { ...notebook, intent_id: 'nb-0002' })).json()) as ApiRequest;
+    const conflict = await postJson(app, '/api/requests', { ...notebook, intent_id: 'nb-0002', amount: '13.00' });
+    expect(conflict.status).toBe(409);
+    expect((await conflict.json()) as ApiRequest).toMatchObject({ error: 'intent_conflict', request_id: made.request_id });
+    expect(repo.listRequests({ agentId: DEMO_AGENT_ID }).length).toBe(1);
+    const bad = await postJson(app, '/api/requests', { ...notebook, intent_id: 'has spaces' });
+    expect(bad.status).toBe(400);
+    expect(((await bad.json()) as ApiRequest).issues?.[0]).toContain('intent_id');
+  });
+});
+
+describe('pending refunds (D17)', () => {
+  it('keeps a refund PayPal has not completed counted, shows it, and settles it when the owner checks', async () => {
+    const { app, repo, fake, published } = setup();
+    fake.refundOutcome = 'PENDING';
+    const paid = (await (await postJson(app, '/api/requests', notebook)).json()) as ApiRequest;
+    const res = await postForm(app, `/requests/${paid.request_id}/refund`);
+    expect(res.status).toBe(303);
+    expect(res.headers.get('location')).toContain('has%20not%20completed');
+    expect(repo.paymentForRequest(paid.request_id)?.status).toBe('REFUND_PENDING');
+    expect(repo.getRequest(paid.request_id)?.status).toBe('PAID');
+    expect(repo.spentThisMonthMinor(DEMO_AGENT_ID, NOW, 'Asia/Tokyo')).toBe(1200);
+    expect(published.at(-1)?.type).toBe('refund.pending');
+    expect(await (await app.request('/')).text()).toContain('Refunds to confirm (1)');
+    const page = await (await app.request(`/requests/${paid.request_id}`)).text();
+    expect(page).toContain('Refund pending');
+    expect(page).toContain(`/requests/${paid.request_id}/refund-check`);
+    expect(page).not.toContain(`action="/requests/${paid.request_id}/refund"`);
+    expect((await postForm(app, `/requests/${paid.request_id}/refund`)).status).toBe(409); // not a second time
+    const api = (await (await app.request(`/api/requests/${paid.request_id}`)).json()) as ApiRequest;
+    expect(api.payment?.status).toBe('REFUND_PENDING');
+    expect(api.message).toContain('refund is pending');
+
+    fake.refundCheck = 'PENDING';
+    expect((await postForm(app, `/requests/${paid.request_id}/refund-check`)).headers.get('location')).toContain('Still%20pending');
+    fake.refundCheck = 'COMPLETED';
+    expect((await postForm(app, `/requests/${paid.request_id}/refund-check`)).status).toBe(303);
+    expect(repo.getRequest(paid.request_id)?.status).toBe('REFUNDED');
+    expect(repo.spentThisMonthMinor(DEMO_AGENT_ID, NOW, 'Asia/Tokyo')).toBe(0);
+    expect(published.at(-1)?.type).toBe('payment.refunded');
+    expect(await (await app.request('/')).text()).not.toContain('Refunds to confirm');
+  });
+
+  it('hands the capture back when the check finds the refund cancelled, and refuses checks that make no sense', async () => {
+    const { app, repo, fake } = setup();
+    fake.refundOutcome = 'PENDING';
+    fake.refundCheck = 'CANCELLED';
+    const paid = (await (await postJson(app, '/api/requests', notebook)).json()) as ApiRequest;
+    await postForm(app, `/requests/${paid.request_id}/refund`);
+    expect((await postForm(app, `/requests/${paid.request_id}/refund-check`)).headers.get('location')).toContain('did%20not%20complete');
+    expect(repo.paymentForRequest(paid.request_id)).toMatchObject({ status: 'COMPLETED', paypalRefundId: null });
+    expect(await (await app.request(`/requests/${paid.request_id}`)).text()).toContain(`action="/requests/${paid.request_id}/refund"`);
+    expect((await postForm(app, `/requests/${paid.request_id}/refund-check`)).status).toBe(409);
+    const keyless = setup({ executor: false });
+    const auto = (await (await postJson(keyless.app, '/api/requests', notebook)).json()) as ApiRequest;
+    expect((await postForm(keyless.app, `/requests/${auto.request_id}/refund-check`)).status).toBe(503);
   });
 });

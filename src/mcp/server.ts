@@ -60,7 +60,7 @@ export function createGuardMcpServer(opts: GuardMcpOptions): McpServer {
     {
       title: 'Request a purchase',
       description:
-        'Ask the owner\'s payment guard to pay for one item. The guard checks the owner\'s rules (per-purchase cap, monthly budget, allowed merchants and categories, hours) and either pays through PayPal (status PAID), holds the request for the owner to decide (HELD; poll get_request_status), or blocks it (BLOCKED). You never receive payment credentials, only statuses and ids. Do not retry a HELD, DENIED or BLOCKED request.',
+        'Ask the owner\'s payment guard to pay for one item. The guard checks the owner\'s rules (per-purchase cap, monthly budget, allowed merchants and categories, hours) and either pays through PayPal (status PAID), holds the request for the owner to decide (HELD; poll get_request_status), or blocks it (BLOCKED). You never receive payment credentials, only statuses and ids. Do not retry a HELD, DENIED or BLOCKED request. If a call fails before you get an answer, send the same request again with the same intent_id: you get the request already made, never a second charge.',
       inputSchema: {
         merchant: z.string().min(1).max(200).describe('Merchant name exactly as shown on the product page'),
         item: z.string().min(1).max(500).describe('What is being bought, e.g. "Field notebook, A5 x1"'),
@@ -69,6 +69,13 @@ export function createGuardMcpServer(opts: GuardMcpOptions): McpServer {
         currency: z.string().length(3).default('USD'),
         reason: z.string().max(2000).describe('Why this purchase is needed, in your own words'),
         source_url: z.string().max(2000).optional().describe('The product page this request is based on'),
+        intent_id: z
+          .string()
+          .min(1)
+          .max(64)
+          .regex(/^[A-Za-z0-9._:-]+$/)
+          .optional()
+          .describe('Your own id for this purchase, e.g. a UUID, letters, digits and . _ : - only. Repeating a request with the same intent_id returns the request already made (replayed: true) instead of creating another; the same id with a different item or amount is refused.'),
       },
     },
     async (args) => reply(await call('POST', '/api/requests', { agent_id: opts.agentId, ...args })),

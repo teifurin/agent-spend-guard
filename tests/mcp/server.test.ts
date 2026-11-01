@@ -103,3 +103,15 @@ describe('guard MCP server', () => {
     expect(result.content[0]?.text).toContain('guard_unreachable');
   });
 });
+
+describe('intent ids (D17)', () => {
+  it('forwards intent_id so a repeated call cannot open a second purchase, and rejects malformed ones locally', async () => {
+    const guard = fakeGuard();
+    const { client } = await connect(guard.fetch);
+    await client.callTool({ name: 'request_purchase', arguments: { merchant: 'Synthetic Books', item: 'Field notebook, A5 x1', category: 'books', amount: '12.00', reason: 'notes', intent_id: 'nb-0001' } });
+    expect(guard.calls[0]?.body).toMatchObject({ agent_id: 'research-bot', intent_id: 'nb-0001' });
+    const bad = (await client.callTool({ name: 'request_purchase', arguments: { merchant: 'x', item: 'y', category: 'z', amount: '12.00', reason: '', intent_id: 'has spaces' } })) as ToolResult;
+    expect(bad.isError).toBe(true);
+    expect(guard.calls.length).toBe(1);
+  });
+});

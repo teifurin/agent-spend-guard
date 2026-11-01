@@ -302,3 +302,127 @@ describe('owner decisions on held requests', () => {
     expect(() => guard.deny('req_nope')).toThrow('unknown request');
   });
 });
+
+describe('intent ids (D17)', () => {
+  it('answers a repeated intent with the request already made: decided once, charged once', async () => {
+    const { charge, executor } = fakeExecutor();
+    const { repo, guard } = setup({ executor });
+    const first = await guard.submit({ ...ok, intentId: 'buy-notebook-1' });
+    if (first.replayed) throw new Error('the first submission must be a fresh decision');
+    // The fake executor writes no payment row; book the capture as the real one would (D10), so the replay can show it.
+    const payment = repo.beginPayment(first.request.id);
+    repo.settlePayment(payment.id, { paypalOrderId: 'O1', paypalCaptureId: 'C1', capturedAt: NOON_JST });
+
+    const again = await guard.submit({ ...ok, intentId: 'buy-notebook-1' });
+    expect(again.replayed).toBe(true);
+    expect(again.request.id).toBe(first.request.id);
+    expect(again.request.status).toBe('PAID');
+    expect(again.decision?.id).toBe(first.decision.id);
+    expect(again.payment?.status).toBe('COMPLETED');
+    expect(charge).toHaveBeenCalledTimes(1);
+    expect(repo.listRequests({ agentId: 'research-bot' }).length).toBe(1);
+    expect(repo.listAudit({ requestId: first.request.id })[0]).toMatchObject({ actor: 'agent:research-bot', action: 'request.replayed', details: { intentId: 'buy-notebook-1' } });
+    expect(repo.spentThisMonthMinor('research-bot', NOON_JST, 'Asia/Tokyo')).toBe(1200);
+  });
+
+  it('refuses the same intent id for a different purchase, and keeps intents apart per agent', async () => {
+    const { repo, guard } = setup();
+    const first = await guard.submit({ ...ok, intentId: 'intent-7' });
+    await expect(guard.submit({ ...ok, intentId: 'intent-7', amountMinor: 1300 })).rejects.toThrow('already names request');
+    await expect(guard.submit({ ...ok, intentId: 'intent-7', item: 'Other notebook', merchant: 'Synthetic Supplies' })).rejects.toThrow('different merchant, item');
+    expect(repo.listRequests({ agentId: 'research-bot' }).length).toBe(1);
+    expect(repo.listAudit({ requestId: first.request.id })[0]).toMatchObject({ action: 'request.intent_conflict', details: { intentId: 'intent-7', differences: ['merchant', 'item'] } });
+
+    repo.createAgent({ id: 'other-bot', name: 'Other bot' });
+    const other = await guard.submit({ ...ok, agentId: 'other-bot', intentId: 'intent-7' });
+    expect(other.replayed).toBe(false);
+    expect(other.request.id).not.toBe(first.request.id);
+  });
+
+  it('replays a request that is still being decided, with no decision yet', async () => {
+    const { reviewer, release } = gate();
+    const { guard } = setup({ reviewer });
+    const pending = guard.submit({ ...ok, intentId: 'slow-1' }); // the row exists before the first await
+    const replay = await guard.submit({ ...ok, intentId: 'slow-1' });
+    expect(replay.replayed).toBe(true);
+    expect(replay.request.status).toBe('EVALUATING');
+    expect(replay.decision).toBeNull();
+    release();
+    const decided = await pending;
+    expect(decided.request.id).toBe(replay.request.id);
+    expect(decided.request.status).toBe('AUTO_APPROVED');
+  });
+});
+
+describe('approving a held request re-checks the hard rules (D17)', () => {
+  it('refuses when the agent was disabled or the hard ceiling lowered since the hold, and the request stays HELD', async () => {
+    const { charge, executor } = fakeExecutor();
+    const { repo, guard } = setup({ executor });
+    const held = await guard.submit({ ...ok, amountMinor: 3001 });
+    repo.setAgentStatus('research-bot', 'disabled');
+    await expect(guard.approve(held.request.id, 'owner')).rejects.toThrow('cannot approve: Agent "research-bot" is disabled');
+    expect(repo.getRequest(held.request.id)?.status).toBe('HELD');
+    expect(charge).not.toHaveBeenCalled();
+    expect(repo.listAudit({ requestId: held.request.id })[0]).toMatchObject({ actor: 'owner', action: 'owner.approve_refused', details: { reasons: ['AGENT_DISABLED'] } });
+
+    repo.setAgentStatus('research-bot', 'active');
+    const policy = repo.getPolicy('research-bot');
+    if (!policy) throw new Error('no policy');
+    repo.savePolicy({ ...policy, maxTxMinor: 2000, hardMaxTxMinor: 3000 });
+    await expect(guard.approve(held.request.id)).rejects.toThrow('above the hard ceiling');
+    expect(repo.getRequest(held.request.id)?.status).toBe('HELD');
+    expect(charge).not.toHaveBeenCalled();
+  });
+
+  it('still lets the owner override the soft rules: cap, budget, merchant', async () => {
+    const { charge, executor } = fakeExecutor();
+    const { repo, guard } = setup({ executor });
+    const held = await guard.submit({ ...ok, amountMinor: 3001 });
+    const policy = repo.getPolicy('research-bot');
+    if (!policy) throw new Error('no policy');
+    repo.savePolicy({ ...policy, monthlyBudgetMinor: 1000, merchantAllowlist: ['Somewhere Else'] });
+    const { request, payment } = await guard.approve(held.request.id, 'owner');
+    expect(request.status).toBe('APPROVED');
+    expect(payment?.status).toBe('COMPLETED');
+    expect(charge).toHaveBeenCalledWith(held.request.id);
+    expect(repo.listAudit({ requestId: held.request.id })[0]).toMatchObject({ actor: 'owner', action: 'owner.approved' });
+  });
+});
+
+describe('recovering requests a previous run left under review (D17)', () => {
+  it('holds them for the owner, oldest first, so they stop counting against the requests that follow', async () => {
+    const { charge, executor } = fakeExecutor();
+    const { repo, guard } = setup({ executor });
+    // What a crash during the review leaves behind: created, never decided.
+    const orphan = repo.createRequest(ok);
+    const younger = repo.createRequest(ok);
+    expect(repo.spentThisMonthMinor('research-bot', NOON_JST, 'Asia/Tokyo', younger.id)).toBe(1200); // the orphan counts against its sibling
+
+    const recovered = await guard.recoverInterrupted();
+    expect(recovered.map((r) => [r.request.id, r.request.status])).toEqual([
+      [orphan.id, 'HELD'],
+      [younger.id, 'HELD'],
+    ]);
+    expect(recovered[0]?.decision).toMatchObject({ policyVerdict: 'ALLOW', finalDecision: 'HOLD', decidedBy: 'reviewer', reviewFlags: ['REVIEWER_UNAVAILABLE'] });
+    expect(recovered[0]?.decision.reviewExplanation).toContain('the guard restarted while this request was under review');
+    expect(charge).not.toHaveBeenCalled();
+    expect(repo.listAudit({ requestId: orphan.id }).map((a) => a.action)).toEqual(['request.decided', 'request.recovered']);
+    expect(repo.spentThisMonthMinor('research-bot', NOON_JST, 'Asia/Tokyo')).toBe(0); // held requests are not in flight
+    expect(repo.evaluatingRequests()).toEqual([]);
+    expect(await guard.recoverInterrupted()).toEqual([]);
+
+    const next = await guard.submit(ok); // nothing phantom stands in the way any more
+    expect(next.request.status).toBe('AUTO_APPROVED');
+  });
+
+  it('blocks an orphan the rules of today forbid outright', async () => {
+    const { repo, guard } = setup();
+    const orphan = repo.createRequest(ok);
+    repo.setAgentStatus('research-bot', 'disabled');
+    const [recovered] = await guard.recoverInterrupted();
+    expect(recovered?.request.status).toBe('BLOCKED');
+    expect(recovered?.decision.policyReasons.map((r) => r.code)).toEqual(['AGENT_DISABLED']);
+    expect(recovered?.review).toBeNull();
+    expect(repo.getRequest(orphan.id)?.status).toBe('BLOCKED');
+  });
+});
