@@ -305,9 +305,10 @@ describe('refunds PayPal does not complete at once (D17)', () => {
     expect(await executor.checkRefund(request.id)).toEqual(done);
   });
 
-  it('hands the capture back when PayPal cancels a pending refund, so it can be refunded again', async () => {
-    const { repo, executor, request } = setup((call) => {
-      if (call.url.endsWith('/refund')) return json({ id: 'R3', status: 'PENDING' }, 201);
+  it('hands the capture back when PayPal cancels a pending refund, and the next refund carries a fresh idempotency key', async () => {
+    let refunds = 0;
+    const { repo, executor, request, calls } = setup((call) => {
+      if (call.url.endsWith('/refund')) return json(++refunds === 1 ? { id: 'R3', status: 'PENDING' } : { id: 'R6', status: 'COMPLETED' }, 201);
       if (call.url.includes('/v2/payments/refunds/R3')) return json({ id: 'R3', status: 'CANCELLED' }, 200);
       return completedOrder('O13', 'C13');
     });
@@ -319,6 +320,14 @@ describe('refunds PayPal does not complete at once (D17)', () => {
     expect(repo.spentThisMonthMinor('research-bot', NOW, 'Asia/Tokyo')).toBe(1200);
     expect(repo.listAudit({ requestId: request.id })[0]).toMatchObject({ action: 'refund.failed', details: { paypalRefundId: 'R3', reason: 'refund R3 is CANCELLED' } });
     await expect(executor.checkRefund(request.id)).rejects.toThrow('only a pending refund can be checked');
+
+    // PayPal would answer the first key with the cancelled refund, so the second attempt must not reuse it (D8, D17).
+    const refunded = await executor.refund(request.id);
+    expect(refunded).toMatchObject({ status: 'REFUNDED', paypalRefundId: 'R6' });
+    expect(repo.getRequest(request.id)?.status).toBe('REFUNDED');
+    const keys = calls.filter((c) => c.url.endsWith('/refund')).map((c) => c.headers['PayPal-Request-Id']);
+    expect(keys).toEqual([refundRequestId(request.id, 'C13'), refundRequestId(request.id, 'C13', 1)]);
+    expect(keys[0]).not.toBe(keys[1]);
   });
 
   it('changes nothing when the refund check itself fails', async () => {

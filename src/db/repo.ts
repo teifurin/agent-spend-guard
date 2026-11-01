@@ -610,6 +610,12 @@ export class Repo {
     return { id: Number(result.lastInsertRowid), ts, actor: entry.actor, action: entry.action, requestId: entry.requestId ?? null, agentId: entry.agentId ?? null, details };
   }
 
+  /** How many times `action` was logged for a request. */
+  countAudit(requestId: string, action: string): number {
+    const row = this.db.prepare('SELECT COUNT(*) AS n FROM audit_log WHERE request_id = ? AND action = ?').get(requestId, action);
+    return num(row?.['n'] ?? 0);
+  }
+
   /** Newest first. */
   listAudit(filter: { requestId?: string; limit?: number } = {}): AuditEntry[] {
     const rows =

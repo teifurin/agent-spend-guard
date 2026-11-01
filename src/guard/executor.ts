@@ -181,10 +181,14 @@ export class PayPalExecutor {
       throw new ExecutorError(`payment "${payment.id}" is ${payment.status}; only a completed capture can be refunded`);
     }
 
+    // A refund PayPal accepted and later cancelled has spent its idempotency key: a repeat of that key would get the
+    // cancelled refund back. The next attempt carries a fresh key, numbered by the refunds PayPal accepted so far,
+    // while a retry after an error that created nothing keeps the first key and is replayed safely (D8, D17).
+    const attempt = this.repo.countAudit(request.id, 'refund.pending');
     let refundId: string;
     let pending: boolean;
     try {
-      const refund = await refundCapture(this.client, request.id, payment.paypalCaptureId);
+      const refund = await refundCapture(this.client, request.id, payment.paypalCaptureId, attempt);
       if (refund.status !== 'COMPLETED' && refund.status !== 'PENDING') throw new ExecutorError(`refund ${refund.id} is ${refund.status}`);
       refundId = refund.id;
       pending = refund.status === 'PENDING';

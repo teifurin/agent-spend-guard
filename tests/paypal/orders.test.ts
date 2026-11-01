@@ -59,6 +59,8 @@ describe('idempotency keys', () => {
     expect(captureRequestId('req_a', 'O1')).toBe(requestIdFor('capture', 'req_a:O1'));
     expect(captureRequestId('req_a', 'O1')).not.toBe(orderRequestId('req_a'));
     expect(refundRequestId('req_a', 'C1')).toMatch(/^asg-refund-[0-9a-f]{32}$/);
+    expect(refundRequestId('req_a', 'C1', 1)).toMatch(/^asg-refund-[0-9a-f]{32}$/);
+    expect(refundRequestId('req_a', 'C1', 1)).not.toBe(refundRequestId('req_a', 'C1')); // a cancelled refund spends its key (D17)
   });
 });
 

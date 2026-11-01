@@ -48,7 +48,12 @@ export const customIdFor = (agentId: string, requestId: string): string => clamp
 
 export const orderRequestId = (requestId: string): string => requestIdFor('order', requestId);
 export const captureRequestId = (requestId: string, orderId: string): string => requestIdFor('capture', `${requestId}:${orderId}`);
-export const refundRequestId = (requestId: string, captureId: string): string => requestIdFor('refund', `${requestId}:${captureId}`);
+/**
+ * Attempt 0 is the first refund of a capture. A later attempt follows a refund PayPal accepted and then cancelled: its
+ * key is spent (a repeat would get the cancelled refund back), so the next one differs (D17).
+ */
+export const refundRequestId = (requestId: string, captureId: string, attempt = 0): string =>
+  requestIdFor('refund', attempt === 0 ? `${requestId}:${captureId}` : `${requestId}:${captureId}:r${attempt}`);
 
 /** Orders v2 body for a charge against the owner's vaulted PayPal, buyer absent. */
 export function buildVaultOrderBody(request: OrderStamp, vaultId: string): Record<string, unknown> {
@@ -96,10 +101,10 @@ export async function getRefund(client: PayPalClient, refundId: string): Promise
   return data;
 }
 
-export async function refundCapture(client: PayPalClient, requestId: string, captureId: string): Promise<PayPalRefund> {
+export async function refundCapture(client: PayPalClient, requestId: string, captureId: string, attempt = 0): Promise<PayPalRefund> {
   const { data } = await client.request<PayPalRefund>('POST', `/v2/payments/captures/${encodeURIComponent(captureId)}/refund`, {
     body: {},
-    requestId: refundRequestId(requestId, captureId),
+    requestId: refundRequestId(requestId, captureId, attempt),
   });
   return data;
 }
