@@ -169,7 +169,7 @@ Note for Node 22.x: the database uses the built-in `node:sqlite`, which prints a
 
 ## AI tools used
 
-Built with Claude Code (Anthropic) for code, tests and docs, reviewed by a human before merge. The initial research and plan were drafted with Grok. At runtime the AI reviewer is Claude through the Vercel AI SDK when `LLM_PROVIDER=anthropic` (verified against the live API on 2026-10-30, see M1); `LLM_PROVIDER=mock` runs the whole demo without any key and says so on every screen. The demo video's narration is Gemini text-to-speech (Google).
+Built with Claude Code (Anthropic), running the **Claude Fable 5.1** model, for code, tests and docs, reviewed by a human before merge; every such commit carries a `Co-Authored-By: Claude Fable 5.1` trailer in the Git history. The initial research and plan were drafted with Grok. OpenAI Codex, run by an external reviewer, audited the repository twice ([D16](docs/DECISIONS.md), [D17](docs/DECISIONS.md)) and contributed one commit of fixes through a pull request ([D18](docs/DECISIONS.md)), verified and merged by a human. At runtime the AI reviewer is Claude through the Vercel AI SDK when `LLM_PROVIDER=anthropic` (verified against the live API on 2026-10-30 with `claude-opus-5-5`, a different model from the one that wrote the code; see M1); `LLM_PROVIDER=mock` runs the whole demo without any key and says so on every screen. The demo video's narration is Gemini text-to-speech (Google).
 
 ## License
 
