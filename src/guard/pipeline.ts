@@ -294,15 +294,24 @@ export class Guard {
   /**
    * The owner retries a charge PayPal never confirmed: the payment is still CREATED and the request still approved
    * (D16). The executor looks the recorded order up, or repeats the create under the same idempotency key, so a retry
-   * cannot charge twice (D8).
+   * cannot charge twice (D8). Only such a payment can be retried. A request that was never charged (the guard ran
+   * keyless when it approved it) has no outcome to find out, and charging it here would skip the rules of this moment
+   * that an approval checks (D17), so it is refused, as is a payment that is already settled (D19).
    */
   async retryCharge(requestId: string, actor: string = 'owner'): Promise<Payment> {
     if (!this.executor) throw new Error('retrying a payment needs PayPal credentials (the guard runs keyless)');
     const request = this.requireRequest(requestId);
+    const refused = (reason: string): Error => {
+      this.repo.appendAudit({ actor, action: 'payment.retry_refused', requestId, agentId: request.agentId, details: { reason } });
+      return new Error(reason);
+    };
     if (request.status !== 'AUTO_APPROVED' && request.status !== 'APPROVED') {
-      throw new Error(`request "${requestId}" is ${request.status}; only an approved request with an unsettled payment can be retried`);
+      throw refused(`request "${requestId}" is ${request.status}; only an approved request with an unsettled payment can be retried`);
     }
-    this.repo.appendAudit({ actor, action: 'payment.retried', requestId, agentId: request.agentId, details: {} });
+    const payment = this.repo.paymentForRequest(requestId);
+    if (!payment) throw refused(`request "${requestId}" was never charged (the guard ran keyless when it approved it); there is no payment to retry`);
+    if (payment.status !== 'CREATED') throw refused(`payment "${payment.id}" is ${payment.status}; only a payment PayPal never confirmed can be retried`);
+    this.repo.appendAudit({ actor, action: 'payment.retried', requestId, agentId: request.agentId, details: { paymentId: payment.id } });
     return this.executor.charge(requestId);
   }
 

@@ -650,3 +650,22 @@ describe('USD-only public boundary and legacy reporting', () => {
     expect(repo.getPolicy(DEMO_AGENT_ID)?.currency).toBe('EUR');
   });
 });
+
+describe('the retry route replays existing payments only (D19)', () => {
+  it('refuses to charge a request the guard approved while keyless, even after the agent was disabled', async () => {
+    const { app, repo, published } = setup();
+    // What a keyless run leaves behind: decided AUTO_APPROVED, never charged, no payment row.
+    const left = repo.createRequest({ agentId: DEMO_AGENT_ID, merchant: 'Synthetic Books', item: 'Field notebook, A5 x1', category: 'books', amountMinor: 1200, currency: 'USD', reason: 'notes' });
+    repo.setRequestStatus(left.id, 'AUTO_APPROVED');
+    repo.setAgentStatus(DEMO_AGENT_ID, 'disabled');
+
+    const res = await postForm(app, `/requests/${left.id}/charge`);
+    expect(res.status).toBe(409);
+    expect(await res.text()).toContain('never charged');
+    expect(repo.paymentForRequest(left.id)).toBeUndefined();
+    expect(repo.getRequest(left.id)?.status).toBe('AUTO_APPROVED');
+    expect(published).toHaveLength(0);
+    expect(repo.listAudit({ requestId: left.id })[0]).toMatchObject({ actor: 'owner', action: 'payment.retry_refused' });
+    expect(await (await app.request(`/requests/${left.id}`)).text()).not.toContain(`/requests/${left.id}/charge`); // no button either
+  });
+});

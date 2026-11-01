@@ -13,7 +13,7 @@ What the guard protects against, what it deliberately leaves out for a hackathon
 | Component | Trusts | Holds |
 | --- | --- | --- |
 | Shopping agent (LLM or mock) | nothing it reads on the web | no credential, no token, no database. Only MCP tool results: the request's own fields, its status, reasons, flags, the reviewer's sentence and PayPal object ids |
-| MCP server (`src/mcp`) | the guard's JSON API | no credential; it does not even load `.env` |
+| MCP server (`src/mcp`) | the guard's JSON API | no credential of its own: it does not load `.env` and is started without PayPal variables in its environment; tool results carry no credential, token or vault id |
 | Guard server (`src/server`, `src/guard`) | its database and the owner | `.env` (sandbox credentials), the database with the vault id |
 | AI reviewer (`src/review`) | nothing it reads: the request, the page and the history are data | the LLM key in anthropic mode (handed to the provider, registered with the redactor); it returns a schema-bound verdict that code can only tighten |
 | Synthetic shop (`src/shop`) | nothing; it is the hostile party in the demo | static pages, no scripts, strict CSP, own origin |

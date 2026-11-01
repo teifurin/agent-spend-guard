@@ -248,10 +248,11 @@ describe('retrying an unsettled payment (D16)', () => {
     const result = await guard.submit(ok);
     expect(result.payment?.status).toBe('CREATED');
     expect(result.request.status).toBe('AUTO_APPROVED');
+    const open = repo.beginPayment(result.request.id); // the fake executor writes no payment row; the real one leaves it CREATED (D16)
     const again = await guard.retryCharge(result.request.id, 'owner');
     expect(charge).toHaveBeenCalledTimes(2);
     expect(again.status).toBe('CREATED');
-    expect(repo.listAudit({ requestId: result.request.id })[0]).toMatchObject({ actor: 'owner', action: 'payment.retried' });
+    expect(repo.listAudit({ requestId: result.request.id })[0]).toMatchObject({ actor: 'owner', action: 'payment.retried', details: { paymentId: open.id } });
   });
 
   it('refuses without an executor and for requests that are not approved', async () => {
@@ -424,5 +425,33 @@ describe('recovering requests a previous run left under review (D17)', () => {
     expect(recovered?.decision.policyReasons.map((r) => r.code)).toEqual(['AGENT_DISABLED']);
     expect(recovered?.review).toBeNull();
     expect(repo.getRequest(orphan.id)?.status).toBe('BLOCKED');
+  });
+});
+
+describe('the retry route replays existing payments only (D19)', () => {
+  it('refuses to charge an approved request the guard never charged, even after the rules changed', async () => {
+    const keyless = setup();
+    const auto = await keyless.guard.submit(ok); // decided without an executor: AUTO_APPROVED, no payment row
+    expect(keyless.repo.paymentForRequest(auto.request.id)).toBeUndefined();
+    keyless.repo.setAgentStatus('research-bot', 'disabled');
+
+    const { charge, executor } = fakeExecutor();
+    const armed = new Guard({ repo: keyless.repo, executor, now: () => NOON_JST });
+    await expect(armed.retryCharge(auto.request.id, 'owner')).rejects.toThrow('was never charged');
+    expect(charge).not.toHaveBeenCalled();
+    expect(keyless.repo.getRequest(auto.request.id)?.status).toBe('AUTO_APPROVED');
+    expect(keyless.repo.paymentForRequest(auto.request.id)).toBeUndefined();
+    expect(keyless.repo.listAudit({ requestId: auto.request.id })[0]).toMatchObject({ actor: 'owner', action: 'payment.retry_refused' });
+  });
+
+  it('refuses once the request is paid, and still replays a payment PayPal never confirmed', async () => {
+    const { charge, executor } = fakeExecutor();
+    const { repo, guard } = setup({ executor });
+    const result = await guard.submit(ok);
+    const payment = repo.beginPayment(result.request.id);
+    await expect(guard.retryCharge(result.request.id)).resolves.toMatchObject({ status: 'COMPLETED' }); // CREATED: replayed
+    repo.settlePayment(payment.id, { paypalOrderId: 'O1', paypalCaptureId: 'C1', capturedAt: NOON_JST });
+    await expect(guard.retryCharge(result.request.id)).rejects.toThrow('only an approved request');
+    expect(charge).toHaveBeenCalledTimes(2); // the charge at submission and the one replay, nothing after settlement
   });
 });
