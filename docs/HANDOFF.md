@@ -110,7 +110,7 @@
 
 **MVP（必须完成）**
 - [ ] 每个 agent 一套规则：单笔上限、月预算（按 JST 自然月）、商家 allowlist、品类 allowlist、时间窗、新商家一律挂起
-- [ ] MCP 工具：`request_purchase({intent_id, merchant, item, category, amount, currency, reason, source_url})`、`get_budget`、`get_request_status`
+- [ ] MCP 工具：`request_purchase({agent_id, merchant, item, category, amount, currency, reason, source_url})`、`get_budget`、`get_request_status`
 - [ ] 确定性规则引擎，返回结果和原因代码，例如 `OVER_TX_CAP`、`OVER_MONTHLY_BUDGET`、`MERCHANT_NOT_ALLOWED`、`OUTSIDE_TIME_WINDOW`
 - [ ] AI 风险审查员：输出 `{risk: low|medium|high, flags[], explanation}`；检查理由和商品是否一致、价格是否异常（跟同一商品的历史价比）、有没有注入迹象（商品页文字在指挥 agent 做事）；只能收紧判断
 - [ ] PayPal sandbox：授权书（Plan A）或 approve 链接（Plan B），扣款、退款
