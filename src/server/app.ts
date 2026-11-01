@@ -49,7 +49,7 @@ const requestSchema = z.object({
   item: z.string().min(1).max(500),
   category: z.string().min(1).max(100),
   amount: z.union([z.string(), z.number()]),
-  currency: z.string().length(3),
+  currency: z.literal('USD'),
   reason: z.string().max(2000),
   source_url: z.string().max(2000).nullable().optional(),
   // The agent's idempotency key (D17): a repeat under the same id returns the request already made.
@@ -57,9 +57,7 @@ const requestSchema = z.object({
     .string()
     .min(1)
     .max(64)
-    .regex(/^[A-Za-z0-9._:-]+$/, 'letters, digits and . _ : - only')
-    .nullable()
-    .optional(),
+    .regex(/^[A-Za-z0-9._:-]+$/, 'letters, digits and . _ : - only'),
 });
 
 function toMinor(amount: string | number): number | undefined {
@@ -171,6 +169,8 @@ export function requestView(repo: Repo, request: PurchaseRequest) {
 export function budgetView(repo: Repo, agent: Agent, nowMs: number) {
   const policy = repo.getPolicy(agent.id);
   if (!policy) return { agent_id: agent.id, status: agent.status, policy: null };
+  const currencyIssue = repo.currencyIssue(agent.id);
+  if (currencyIssue) return { agent_id: agent.id, status: agent.status, policy: null, error: 'unsupported_currency', message: currencyIssue, spent: null, remaining: null };
   const { key } = monthBounds(nowMs, policy.timezone);
   const spent = repo.spentThisMonthMinor(agent.id, nowMs, policy.timezone);
   return {
@@ -460,11 +460,12 @@ ${deps.reviewer ? html`<div class="notice">AI reviewer: <strong>${deps.reviewer.
 <div class="grid">
 ${agents.map((a) => {
   const policy = repo.getPolicy(a.id);
-  const spent = policy ? repo.spentThisMonthMinor(a.id, nowMs, policy.timezone) : 0;
+  const currencyIssue = repo.currencyIssue(a.id);
+  const spent = policy && !currencyIssue ? repo.spentThisMonthMinor(a.id, nowMs, policy.timezone) : 0;
   const pct = policy ? Math.min(100, Math.round((spent / policy.monthlyBudgetMinor) * 100)) : 0;
   return html`<div class="card">
   <strong>${a.name}</strong> <span class="muted mono">${a.id}</span> <span class="badge ${a.status === 'active' ? 'ok' : 'bad'}">${a.status}</span>
-  ${policy ? html`<div class="bar"><div style="width:${pct}%"></div></div><div class="muted">${money(spent, policy.currency)} of ${money(policy.monthlyBudgetMinor, policy.currency)} this month (${monthBounds(nowMs, policy.timezone).key})</div>` : ''}
+  ${currencyIssue ? html`<div class="error">${currencyIssue}</div>` : policy ? html`<div class="bar"><div style="width:${pct}%"></div></div><div class="muted">${money(spent, policy.currency)} of ${money(policy.monthlyBudgetMinor, policy.currency)} this month (${monthBounds(nowMs, policy.timezone).key})</div>` : ''}
   ${policySummary(policy)}
   <p><a href="/policies/${a.id}">Edit rules</a></p>
 </div>`;
@@ -653,7 +654,7 @@ ${unsettled && executor ? html`<form method="post" action="/requests/${request.i
 ${error ? html`<div class="error">${error}</div>` : ''}
 ${saved ? html`<div class="notice">Saved.</div>` : ''}
 <form method="post" action="/policies/${agent.id}" class="card">
-  <label>Currency</label><input name="currency" value="${p?.currency ?? 'USD'}" maxlength="3" required>
+  <label>Currency (USD only)</label><input name="currency" value="${p?.currency ?? 'USD'}" maxlength="3" readonly required>
   <label>Max per purchase (held above this)</label><input name="max_tx" value="${p ? formatAmount(p.maxTxMinor) : '30.00'}" required>
   <label>Hard max per purchase (blocked above this; empty = none)</label><input name="hard_max_tx" value="${p?.hardMaxTxMinor === null || p?.hardMaxTxMinor === undefined ? '' : formatAmount(p.hardMaxTxMinor)}">
   <label>Monthly budget</label><input name="monthly_budget" value="${p ? formatAmount(p.monthlyBudgetMinor) : '100.00'}" required>
@@ -710,7 +711,11 @@ ${saved ? html`<div class="notice">Saved.</div>` : ''}
     };
     problems.push(...validatePolicy(candidate));
     if (problems.length > 0) return c.html(page('Rules', policyForm(agent, repo.getPolicy(agent.id), problems.join('; '))), 400);
-    repo.savePolicy(candidate);
+    try {
+      repo.savePolicy(candidate);
+    } catch (err) {
+      return c.html(page('Rules', policyForm(agent, repo.getPolicy(agent.id), err instanceof Error ? err.message : 'Policy could not be saved')), 400);
+    }
     repo.appendAudit({ actor: 'owner', action: 'policy.saved', agentId: agent.id, details: { source: 'dashboard' } });
     events.publish({ type: 'policy.saved', agentId: agent.id, at: now() });
     return c.redirect(`/policies/${agent.id}?saved=1`, 303);
@@ -830,7 +835,7 @@ ${mandates.length === 0 ? '' : html`<h2>Mandates</h2><div class="card"><table><t
         currency: input.currency.toUpperCase(),
         reason: input.reason,
         sourceUrl: input.source_url ?? null,
-        intentId: input.intent_id ?? null,
+        intentId: input.intent_id,
       });
     } catch (err) {
       // The same intent id with a different purchase behind it: nothing is made, the agent needs a new id (D17).

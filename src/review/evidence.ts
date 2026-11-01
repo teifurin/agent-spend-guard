@@ -50,13 +50,14 @@ export interface ReviewEvidence {
 
 const HISTORY_LIMIT = 20;
 
-/** Earlier accepted purchases of the same item at the same merchant, any agent, newest first. */
+/** Earlier accepted USD purchases of the same item at the same merchant, any agent, newest first. */
 export function gatherHistory(repo: Repo, request: PurchaseRequest): PriceHistory {
   const { itemKey } = parseItem(request.item);
   const rows = repo.listRequests({ merchantKey: request.merchantKey, statuses: ACCEPTED_STATUSES, limit: 200 });
   const observations: PriceObservation[] = [];
   for (const r of rows) {
-    if (r.id === request.id) continue;
+    // History is shared across agents: a quarantined legacy agent must not contaminate a clean USD agent's prices.
+    if (r.id === request.id || r.currency !== 'USD' || r.currency !== request.currency) continue;
     const parsed = parseItem(r.item);
     if (parsed.itemKey !== itemKey) continue;
     observations.push({ requestId: r.id, unitMinor: Math.round(r.amountMinor / parsed.quantity), quantity: parsed.quantity, createdAt: r.createdAt });

@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { openDatabase } from '../../src/db/connection.js';
 import { Repo } from '../../src/db/repo.js';
@@ -37,8 +40,8 @@ function fakePayPal(handler: Handler) {
   return { calls, fetch: fetchMock as unknown as typeof fetch };
 }
 
-function setup(handler: Handler, opts: { mandate?: boolean; amountMinor?: number } = {}) {
-  const repo = new Repo(openDatabase(), () => NOW);
+function setup(handler: Handler, opts: { mandate?: boolean; amountMinor?: number; dbPath?: string } = {}) {
+  const repo = new Repo(openDatabase(opts.dbPath), () => NOW);
   const logs: string[] = [];
   const paypal = fakePayPal(handler);
   const client = new PayPalClient(cfg, { fetch: paypal.fetch, log: (l) => logs.push(l) });
@@ -340,5 +343,68 @@ describe('refunds PayPal does not complete at once (D17)', () => {
     await executor.refund(request.id);
     await expect(executor.checkRefund(request.id)).rejects.toThrow('could not check refund R4: PayPal 503 INTERNAL_SERVER_ERROR debug_id=d50');
     expect(repo.paymentForRequest(request.id)?.status).toBe('REFUND_PENDING');
+  });
+});
+
+
+describe('durable refund attempts', () => {
+  it('retries an unknown remote outcome with the same key, without advancing the durable counter', async () => {
+    let attempts = 0;
+    const { repo, executor, request, calls } = setup((call) => {
+      if (!call.url.endsWith('/refund')) return completedOrder('O-unknown', 'C-unknown');
+      if (++attempts === 1) throw new TypeError('connection lost after refund reached PayPal');
+      return json({ id: 'R-unknown', status: 'PENDING' }, 201);
+    });
+    await executor.charge(request.id);
+    await expect(executor.refund(request.id)).rejects.toThrow('refund failed');
+    expect(repo.countAudit(request.id, 'refund.pending')).toBe(0);
+    expect((await executor.refund(request.id)).status).toBe('REFUND_PENDING');
+    expect(repo.countAudit(request.id, 'refund.pending')).toBe(1);
+    expect(calls.filter((c) => c.url.endsWith('/refund')).map((c) => c.headers['PayPal-Request-Id']))
+      .toEqual([refundRequestId(request.id, 'C-unknown'), refundRequestId(request.id, 'C-unknown')]);
+  });
+
+  it.each(['audit', 'payment'])('rolls back a failed %s write, replays the same key after restart, then advances after cancellation', async (failure) => {
+    const dir = mkdtempSync(join(tmpdir(), 'spendguard-refund-'));
+    const path = join(dir, 'guard.db');
+    let activeRepo: Repo | undefined;
+    try {
+      const handler: Handler = (call) => {
+        if (call.url.endsWith('/refund')) {
+          const next = call.headers['PayPal-Request-Id'] === refundRequestId(request.id, 'C-durable', 1);
+          return json({ id: next ? 'R-next' : 'R-durable', status: next ? 'COMPLETED' : 'PENDING' }, 201);
+        }
+        if (call.url.includes('/v2/payments/refunds/')) return json({ id: 'R-durable', status: 'CANCELLED' });
+        return completedOrder('O-durable', 'C-durable');
+      };
+      const { repo, executor, request, calls } = setup(handler, { dbPath: path });
+      activeRepo = repo;
+      const payment = await executor.charge(request.id);
+      repo.db.exec(failure === 'audit'
+        ? "CREATE TRIGGER fail_pending BEFORE INSERT ON audit_log WHEN NEW.action = 'refund.pending' BEGIN SELECT RAISE(ABORT, 'injected failure'); END"
+        : "CREATE TRIGGER fail_pending BEFORE UPDATE ON payments WHEN NEW.status = 'REFUND_PENDING' BEGIN SELECT RAISE(ABORT, 'injected failure'); END");
+      await expect(executor.refund(request.id)).rejects.toThrow('injected failure');
+      expect(repo.getPayment(payment.id)).toMatchObject({ status: 'COMPLETED', paypalRefundId: null });
+      expect(repo.countAudit(request.id, 'refund.pending')).toBe(0);
+      repo.db.exec('DROP TRIGGER fail_pending');
+      repo.db.close();
+      activeRepo = new Repo(openDatabase(path), () => NOW);
+      const fake = fakePayPal(handler);
+      let resumed = new PayPalExecutor({ repo: activeRepo, client: new PayPalClient(cfg, { fetch: fake.fetch }), now: () => NOW });
+      expect((await resumed.refund(request.id)).status).toBe('REFUND_PENDING');
+      expect(fake.calls[0]?.headers['PayPal-Request-Id']).toBe(calls[1]?.headers['PayPal-Request-Id']);
+      expect(activeRepo.countAudit(request.id, 'refund.pending')).toBe(1);
+      activeRepo.markRefundPending(payment.id, 'R-durable');
+      expect(activeRepo.countAudit(request.id, 'refund.pending')).toBe(1); // idempotent replay must not skip a key
+      activeRepo.db.close();
+      activeRepo = new Repo(openDatabase(path), () => NOW);
+      resumed = new PayPalExecutor({ repo: activeRepo, client: new PayPalClient(cfg, { fetch: fake.fetch }), now: () => NOW });
+      expect((await resumed.checkRefund(request.id)).status).toBe('COMPLETED');
+      expect((await resumed.refund(request.id)).status).toBe('REFUNDED');
+      expect(fake.calls.at(-1)?.headers['PayPal-Request-Id']).toBe(refundRequestId(request.id, 'C-durable', 1));
+    } finally {
+      activeRepo?.db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

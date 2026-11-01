@@ -19,7 +19,7 @@ export interface TimeWindow {
 /** The owner's spending rules for one agent. Amounts are integer minor units (cents). */
 export interface Policy {
   agentId: string;
-  /** ISO 4217 code; requests in any other currency are blocked. */
+  /** USD only for new policies; legacy codes remain readable for explicit reconciliation. */
   currency: string;
   /** Soft per-transaction cap: above it the request is held for the owner. */
   maxTxMinor: number;

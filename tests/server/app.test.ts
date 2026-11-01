@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import type { Hono } from 'hono';
 import { openDatabase } from '../../src/db/connection.js';
@@ -70,7 +71,8 @@ function setup(opts: { executor?: boolean; paypal?: PayPalClient; outcome?: 'COM
   return { repo, app, events, published, fake };
 }
 
-const postJson = (app: Hono, path: string, body: unknown) => app.request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+// Each ordinary API fixture is a new purchase; explicit intent_id values (including undefined) override this default.
+const postJson = (app: Hono, path: string, body: unknown) => app.request(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(path === '/api/requests' && typeof body === 'object' && body !== null ? { intent_id: randomUUID(), ...body } : body) });
 // A browser posting a dashboard form sends Origin (or Sec-Fetch-Site: same-origin); hono/csrf refuses the form without it (D16).
 const postForm = (app: Hono, path: string, fields: Record<string, string> = {}) =>
   app.request(path, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', origin: 'http://localhost' }, body: new URLSearchParams(fields).toString() });
@@ -530,6 +532,15 @@ describe('PayPal link flow', () => {
 });
 
 describe('intent ids (D17)', () => {
+  it.each([undefined, null, '', ' ', 'bad key', 'x'.repeat(65)])('rejects a missing or invalid intent id (%s) before creating or charging', async (intentId) => {
+    const { app, repo, published } = setup();
+    const res = await postJson(app, '/api/requests', { ...notebook, intent_id: intentId });
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as ApiRequest).issues?.some((issue) => issue.startsWith('intent_id:'))).toBe(true);
+    expect(repo.listRequests({ agentId: DEMO_AGENT_ID })).toHaveLength(0);
+    expect(published).toHaveLength(0);
+  });
+
   it('answers a repeated request_purchase with the request already made: 200, replayed, nothing charged twice', async () => {
     const { app, repo, published } = setup();
     const first = await postJson(app, '/api/requests', { ...notebook, intent_id: 'nb-0001' });
@@ -602,5 +613,40 @@ describe('pending refunds (D17)', () => {
     const keyless = setup({ executor: false });
     const auto = (await (await postJson(keyless.app, '/api/requests', notebook)).json()) as ApiRequest;
     expect((await postForm(keyless.app, `/requests/${auto.request_id}/refund-check`)).status).toBe(503);
+  });
+});
+
+
+describe('USD-only public boundary and legacy reporting', () => {
+  it.each(['EUR', 'JPY', 'usd'])('rejects request currency %s before creating financial state', async (currency) => {
+    const { app, repo } = setup();
+    const before = repo.listRequests().length;
+    const res = await postJson(app, '/api/requests', { ...notebook, currency });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: 'invalid_request' });
+    expect(repo.listRequests()).toHaveLength(before);
+  });
+
+  it('rejects non-USD policy form submissions server-side', async () => {
+    const { app, repo } = setup();
+    const before = repo.getPolicy(DEMO_AGENT_ID);
+    const res = await postForm(app, `/policies/${DEMO_AGENT_ID}`, { currency: 'EUR', max_tx: '30.00', monthly_budget: '100.00', timezone: 'UTC' });
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain('currency must be USD');
+    expect(repo.getPolicy(DEMO_AGENT_ID)).toEqual(before);
+  });
+
+  it('reports legacy budget unavailable and blocks new purchases without rewriting history', async () => {
+    const { app, repo } = setup();
+    repo.db.exec("UPDATE policies SET currency = 'EUR'");
+    const res = await app.request(`/api/agents/${DEMO_AGENT_ID}/budget`);
+    expect(await res.json()).toMatchObject({ error: 'unsupported_currency', spent: null, remaining: null });
+    const dashboard = await app.request('/');
+    expect(dashboard.status).toBe(200);
+    expect(await dashboard.text()).toContain('legacy non-USD financial data');
+    const purchase = await postJson(app, '/api/requests', notebook);
+    expect(purchase.status).toBe(201);
+    expect(await purchase.json()).toMatchObject({ status: 'BLOCKED', payment: null });
+    expect(repo.getPolicy(DEMO_AGENT_ID)?.currency).toBe('EUR');
   });
 });

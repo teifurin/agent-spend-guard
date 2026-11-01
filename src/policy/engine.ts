@@ -6,6 +6,8 @@ import { formatLocalTime, isWithinWindow, localMinutes, monthKey, parseHHMM } fr
 
 export interface PolicyContext {
   nowMs: number;
+  /** Legacy non-USD financial data requires explicit operator reconciliation, never implicit conversion. */
+  currencyIssue?: string;
   /** Completed captures in the policy month plus approved requests not yet captured (DECISIONS D10). */
   spentThisMonthMinor: number;
   /** Normalized names of merchants this agent has paid before. */
@@ -57,6 +59,11 @@ export function evaluatePolicy({ agent, policy, request, context }: PolicyInput)
 
   if (!policy) {
     add('NO_POLICY', 'No spending policy is configured for this agent');
+    return result(null);
+  }
+
+  if (policy.currency !== 'USD' || context.currencyIssue) {
+    add('UNSUPPORTED_CURRENCY', context.currencyIssue ?? 'Only USD policies are supported; reconcile the legacy policy before spending');
     return result(null);
   }
 

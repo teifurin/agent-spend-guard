@@ -98,3 +98,25 @@ describe('mock reviewer inside the guard', () => {
     expect(DEMO_POLICY.maxTxMinor).toBe(3000);
   });
 });
+
+
+describe('currency-safe shared price history', () => {
+  it('excludes another agent’s accepted and refunded legacy currency prices while retaining USD evidence', async () => {
+    const { repo, reviewer, input } = setup();
+    repo.createAgent({ id: 'legacy-agent', name: 'Legacy agent' });
+    for (const status of ['AUTO_APPROVED', 'APPROVED', 'PAID', 'REFUNDED'] as const) {
+      const legacy = repo.createRequest({ ...notebook, agentId: 'legacy-agent', currency: 'EUR', amountMinor: 100 });
+      repo.setRequestStatus(legacy.id, status);
+    }
+    const usd = repo.createRequest({ ...notebook, agentId: 'legacy-agent' });
+    repo.setRequestStatus(usd.id, 'PAID');
+    const current = repo.createRequest(notebook);
+    expect(repo.currencyIssue(DEMO_AGENT_ID)).toBeUndefined();
+    expect(repo.currencyIssue('legacy-agent')).toMatch(/legacy non-USD/);
+    expect(gatherHistory(repo, current).observations).toEqual([{ requestId: usd.id, unitMinor: 1200, quantity: 1, createdAt: NOW }]);
+    expect((await reviewer(input(current), never)).flags).not.toContain('PRICE_ANOMALY');
+    // A legacy request also cannot compare USD cents as though they were EUR minor units.
+    const legacyRequest = repo.createRequest({ ...notebook, agentId: 'legacy-agent', currency: 'EUR' });
+    expect(gatherHistory(repo, legacyRequest).observations).toEqual([]);
+  });
+});

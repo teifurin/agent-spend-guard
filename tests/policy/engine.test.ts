@@ -192,3 +192,19 @@ describe('evaluatePolicy: composition', () => {
     expect(a).toEqual(b);
   });
 });
+
+
+describe('USD-only legacy quarantine', () => {
+  it('blocks even matching non-USD policy and request instead of treating their minor units as USD', () => {
+    const result = run({ policy: { ...policy, currency: 'JPY' }, request: { currency: 'JPY' } });
+    expect(result.verdict).toBe('BLOCK');
+    expect(codes(result)).toContain('UNSUPPORTED_CURRENCY');
+    expect(result.budget).toBeNull();
+  });
+
+  it('blocks a USD request with quarantined legacy history and does not expose a false budget', () => {
+    const result = run({ context: { currencyIssue: 'Legacy EUR ledger requires reconciliation' } });
+    expect(result.verdict).toBe('BLOCK');
+    expect(result.budget).toBeNull();
+  });
+});

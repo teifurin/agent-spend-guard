@@ -1,4 +1,4 @@
-import { isCurrencyCode, isValidMinor } from '../domain/money.js';
+import { isValidMinor } from '../domain/money.js';
 import type { Policy } from '../domain/types.js';
 import { isValidTimeZone, parseHHMM } from './time.js';
 
@@ -6,7 +6,7 @@ import { isValidTimeZone, parseHHMM } from './time.js';
 export function validatePolicy(policy: Omit<Policy, 'updatedAt'>): string[] {
   const problems: string[] = [];
   if (!policy.agentId) problems.push('agentId is required');
-  if (!isCurrencyCode(policy.currency)) problems.push('currency must be a three-letter ISO 4217 code such as USD');
+  if (policy.currency !== 'USD') problems.push('currency must be USD; this version does not support currency conversion');
   if (!isValidMinor(policy.maxTxMinor)) problems.push('maxTxMinor must be a positive integer');
   if (policy.hardMaxTxMinor !== null && (!isValidMinor(policy.hardMaxTxMinor) || policy.hardMaxTxMinor < policy.maxTxMinor)) {
     problems.push('hardMaxTxMinor must be null or an integer greater than or equal to maxTxMinor');

@@ -200,7 +200,6 @@ export class PayPalExecutor {
 
     if (pending) {
       const open = this.repo.markRefundPending(payment.id, refundId);
-      this.audit('refund.pending', request.id, request.agentId, { paymentId: payment.id, paypalCaptureId: payment.paypalCaptureId, paypalRefundId: refundId });
       this.log(`payment ${payment.id} REFUND_PENDING refund ${refundId}: the amount stays counted until PayPal completes it`);
       return open;
     }

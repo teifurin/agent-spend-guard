@@ -66,7 +66,7 @@ export function createGuardMcpServer(opts: GuardMcpOptions): McpServer {
         item: z.string().min(1).max(500).describe('What is being bought, e.g. "Field notebook, A5 x1"'),
         category: z.string().min(1).max(100).describe('Product category, e.g. books, office, electronics'),
         amount: z.string().regex(/^\d{1,10}\.\d{2}$/).describe('Total amount with two decimals, e.g. "12.00"'),
-        currency: z.string().length(3).default('USD'),
+        currency: z.literal('USD').default('USD'),
         reason: z.string().max(2000).describe('Why this purchase is needed, in your own words'),
         source_url: z.string().max(2000).optional().describe('The product page this request is based on'),
         intent_id: z
@@ -74,8 +74,7 @@ export function createGuardMcpServer(opts: GuardMcpOptions): McpServer {
           .min(1)
           .max(64)
           .regex(/^[A-Za-z0-9._:-]+$/)
-          .optional()
-          .describe('Your own id for this purchase, e.g. a UUID, letters, digits and . _ : - only. Repeating a request with the same intent_id returns the request already made (replayed: true) instead of creating another; the same id with a different item or amount is refused.'),
+          .describe('Required stable id: generate once per purchase and reuse on every retry. Your own id for this purchase, e.g. a UUID, letters, digits and . _ : - only. Repeating a request with the same intent_id returns the request already made (replayed: true) instead of creating another; the same id with a different item or amount is refused.'),
       },
     },
     async (args) => reply(await call('POST', '/api/requests', { agent_id: opts.agentId, ...args })),

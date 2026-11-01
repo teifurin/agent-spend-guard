@@ -23,6 +23,7 @@ describe('validatePolicy', () => {
 
   it.each<[string, Partial<Omit<Policy, 'updatedAt'>>, RegExp]>([
     ['missing agent', { agentId: '' }, /agentId/],
+    ['non-USD currency', { currency: 'EUR' }, /currency must be USD/],
     ['bad currency', { currency: 'usd' }, /currency/],
     ['zero cap', { maxTxMinor: 0 }, /maxTxMinor/],
     ['fractional cap', { maxTxMinor: 12.5 }, /maxTxMinor/],

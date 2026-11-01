@@ -415,3 +415,69 @@ describe('schema changes since 001 (D17)', () => {
     expect(repo.evaluatingRequests().map((r) => r.id)).toEqual([a.id, c.id]);
   });
 });
+
+
+describe('USD-only ledger protection', () => {
+  it('rejects a policy currency switch after a charge, preserving the policy and ledger', () => {
+    const { repo } = setup();
+    repo.savePolicy(policyInput);
+    const req = repo.createRequest(baseRequest);
+    repo.setRequestStatus(req.id, 'APPROVED');
+    const pay = repo.beginPayment(req.id);
+    repo.settlePayment(pay.id, { paypalOrderId: 'O1', paypalCaptureId: 'C1', capturedAt: OCT_27_NOON_JST });
+    expect(() => repo.savePolicy({ ...policyInput, currency: 'EUR' })).toThrow(/USD/);
+    expect(repo.getPolicy('research-bot')?.currency).toBe('USD');
+    expect(repo.getPayment(pay.id)?.currency).toBe('USD');
+    expect(repo.spentThisMonthMinor('research-bot', OCT_27_NOON_JST, 'Asia/Tokyo')).toBe(1200);
+  });
+
+  it('quarantines legacy non-USD financial rows without changing or summing them', () => {
+    const { repo, db } = setup();
+    repo.savePolicy(policyInput);
+    const req = repo.createRequest(baseRequest);
+    repo.setRequestStatus(req.id, 'APPROVED');
+    const pay = repo.beginPayment(req.id);
+    db.prepare("UPDATE payments SET currency = 'EUR' WHERE id = ?").run(pay.id);
+    const before = repo.getPayment(pay.id);
+    expect(repo.currencyIssue('research-bot')).toMatch(/reconciliation/);
+    expect(() => repo.spentThisMonthMinor('research-bot', OCT_27_NOON_JST, 'Asia/Tokyo')).toThrow(/legacy non-USD/);
+    const context = repo.policyContext('research-bot');
+    const verdict = evaluatePolicy({ agent: repo.getAgent('research-bot'), policy: repo.getPolicy('research-bot'), request: baseRequest, context });
+    expect(verdict.verdict).toBe('BLOCK');
+    expect(verdict.budget).toBeNull();
+    expect(() => repo.beginPayment(req.id)).toThrow(/legacy non-USD/);
+    expect(repo.getPayment(pay.id)).toEqual(before);
+  });
+
+  it('refuses relabelling a legacy policy with financial history but permits an unused policy to be corrected', () => {
+    const { repo, db } = setup();
+    repo.savePolicy(policyInput);
+    db.exec("UPDATE policies SET currency = 'EUR'");
+    expect(repo.currencyIssue('research-bot')).toMatch(/legacy non-USD/);
+    repo.savePolicy(policyInput); // no financial history: correcting the policy does not reinterpret money
+    const req = repo.createRequest(baseRequest);
+    repo.setRequestStatus(req.id, 'APPROVED');
+    db.exec("UPDATE policies SET currency = 'EUR'");
+    expect(() => repo.savePolicy(policyInput)).toThrow(/cannot change currency with financial history/);
+    expect(repo.getPolicy('research-bot')?.currency).toBe('EUR');
+    expect(repo.getRequest(req.id)?.currency).toBe('USD');
+  });
+
+  it('does not quarantine harmless blocked non-USD requests', () => {
+    const { repo } = setup();
+    repo.savePolicy(policyInput);
+    const req = repo.createRequest({ ...baseRequest, currency: 'JPY' });
+    repo.setRequestStatus(req.id, 'BLOCKED');
+    expect(repo.currencyIssue('research-bot')).toBeUndefined();
+    expect(repo.spentThisMonthMinor('research-bot', OCT_27_NOON_JST, 'Asia/Tokyo')).toBe(0);
+  });
+});
+
+
+it('does not add a legacy non-USD evaluating request to a USD budget', () => {
+  const { repo } = setup();
+  repo.savePolicy(policyInput);
+  repo.createRequest({ ...baseRequest, currency: 'JPY', amountMinor: 100000 });
+  const usd = repo.createRequest(baseRequest);
+  expect(repo.spentThisMonthMinor('research-bot', OCT_27_NOON_JST, 'Asia/Tokyo', usd.id)).toBe(0);
+});

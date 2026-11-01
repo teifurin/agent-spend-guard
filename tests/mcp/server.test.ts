@@ -51,10 +51,11 @@ describe('guard MCP server', () => {
     const { client } = await connect(guard.fetch);
     const tools = await client.listTools();
     expect(tools.tools.map((t) => t.name).sort()).toEqual(['get_budget', 'get_request_status', 'request_purchase']);
+    expect(tools.tools.find((t) => t.name === 'request_purchase')?.inputSchema.required).toContain('intent_id');
 
     const result = (await client.callTool({
       name: 'request_purchase',
-      arguments: { merchant: 'Synthetic Books', item: 'Field notebook, A5 x1', category: 'books', amount: '12.00', reason: 'notes', source_url: 'http://shop.test/products/field-notebook-a5' },
+      arguments: { intent_id: 'test-purchase', merchant: 'Synthetic Books', item: 'Field notebook, A5 x1', category: 'books', amount: '12.00', reason: 'notes', source_url: 'http://shop.test/products/field-notebook-a5' },
     })) as ToolResult;
     expect(result.isError).toBe(false);
     expect(result.structuredContent).toMatchObject({ request_id: 'req_paid', status: 'PAID' });
@@ -69,7 +70,7 @@ describe('guard MCP server', () => {
   it('reports held requests, status checks and the budget', async () => {
     const guard = fakeGuard();
     const { client } = await connect(guard.fetch);
-    const held = (await client.callTool({ name: 'request_purchase', arguments: { merchant: 'Synthetic Gadgets', item: 'USB microscope', category: 'electronics', amount: '45.00', reason: 'lab' } })) as ToolResult;
+    const held = (await client.callTool({ name: 'request_purchase', arguments: { intent_id: 'test-purchase', merchant: 'Synthetic Gadgets', item: 'USB microscope', category: 'electronics', amount: '45.00', reason: 'lab' } })) as ToolResult;
     expect(held.structuredContent).toMatchObject({ status: 'HELD' });
 
     const status = (await client.callTool({ name: 'get_request_status', arguments: { request_id: 'req_held' } })) as ToolResult;
@@ -83,7 +84,7 @@ describe('guard MCP server', () => {
   it('rejects malformed amounts before calling the guard and flags guard errors', async () => {
     const guard = fakeGuard();
     const { client } = await connect(guard.fetch);
-    const invalid = (await client.callTool({ name: 'request_purchase', arguments: { merchant: 'x', item: 'y', category: 'z', amount: '12', reason: '' } })) as ToolResult;
+    const invalid = (await client.callTool({ name: 'request_purchase', arguments: { intent_id: 'test-purchase', merchant: 'x', item: 'y', category: 'z', amount: '12', reason: '' } })) as ToolResult;
     expect(invalid.isError).toBe(true);
     expect(invalid.content[0]?.text).toContain('amount');
     expect(guard.calls.length).toBe(0);
@@ -105,6 +106,15 @@ describe('guard MCP server', () => {
 });
 
 describe('intent ids (D17)', () => {
+  it.each([undefined, null, ''])('requires an intent id (%s) before making an API call', async (intentId) => {
+    const guard = fakeGuard();
+    const { client } = await connect(guard.fetch);
+    const result = (await client.callTool({ name: 'request_purchase', arguments: { merchant: 'x', item: 'y', category: 'books', amount: '12.00', reason: '', intent_id: intentId } })) as ToolResult;
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toContain('intent_id');
+    expect(guard.calls).toHaveLength(0);
+  });
+
   it('forwards intent_id so a repeated call cannot open a second purchase, and rejects malformed ones locally', async () => {
     const guard = fakeGuard();
     const { client } = await connect(guard.fetch);
@@ -114,4 +124,18 @@ describe('intent ids (D17)', () => {
     expect(bad.isError).toBe(true);
     expect(guard.calls.length).toBe(1);
   });
+});
+
+
+it('rejects non-USD MCP purchases without forwarding a guard request', async () => {
+  const guard = fakeGuard();
+  const { client, server } = await connect(guard.fetch);
+  try {
+    const result = (await client.callTool({ name: 'request_purchase', arguments: { intent_id: 'non-usd', merchant: 'Books', item: 'Book', category: 'books', amount: '12.00', currency: 'EUR', reason: 'read' } })) as ToolResult;
+    expect(result.isError).toBe(true);
+    expect(guard.calls).toHaveLength(0);
+  } finally {
+    await client.close();
+    await server.close();
+  }
 });

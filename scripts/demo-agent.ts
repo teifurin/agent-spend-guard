@@ -4,6 +4,7 @@
  *
  *   npm run demo:agent                      # all four scenarios, in order
  *   npm run demo:agent -- --scenario 2      # one: 1 notebook, 2 microscope, 3 pens (the hostile page), 4 the notebook at 2.4x the price
+ *   npm run demo:agent -- --scenario 1 --intent-id saved-purchase-id # resume an interrupted purchase
  *   npm run demo:agent -- --wait 180        # how long to wait for the owner on a held request (seconds, 0 = don't)
  *
  * Scenario 4 only shows the price check when scenario 1 ran before it (in this database): the reviewer compares
@@ -12,8 +13,10 @@
  * Needs `npm run dev` running. Reads SHOP_URL, GUARD_URL and AGENT_ID from the environment (not from .env: this
  * process and the MCP server it spawns never see PayPal credentials).
  */
+import { randomUUID } from 'node:crypto';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { getDefaultEnvironment, StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { requestPurchaseWithRetry } from '../src/agent/purchase.js';
 import { parseProductPage, planPurchase, type PurchasePlan } from '../src/agent/mock-agent.js';
 
 const SHOP_URL = (process.env.SHOP_URL?.trim() || 'http://localhost:3001').replace(/\/+$/, '');
@@ -43,6 +46,7 @@ interface ToolResult {
 interface Args {
   scenarios: Scenario[];
   waitSeconds: number;
+  intentId?: string;
 }
 
 function parseArgs(argv: string[]): Args {
@@ -54,12 +58,17 @@ function parseArgs(argv: string[]): Args {
       const s = SCENARIOS.find((x) => x.n === n);
       if (!s) throw new Error('--scenario must be 1, 2, 3 or 4');
       args.scenarios = [s];
+    } else if (a === '--intent-id') {
+      const id = argv[++i] ?? '';
+      if (!/^[A-Za-z0-9._:-]{1,64}$/.test(id)) throw new Error('--intent-id must be 1–64 letters, digits or . _ : -');
+      args.intentId = id;
     } else if (a === '--wait') {
       args.waitSeconds = Math.max(0, Number(argv[++i] ?? '0'));
     } else {
       throw new Error(`unknown argument: ${a}`);
     }
   }
+  if (args.intentId && args.scenarios.length !== 1) throw new Error('--intent-id requires one --scenario');
   return args;
 }
 
@@ -129,10 +138,17 @@ async function main(): Promise<void> {
     const plan: PurchasePlan = planPurchase(page);
     say(`asking the guard to pay ${plan.amount} ${plan.currency} for "${plan.item}" at ${plan.merchant}; reason: "${plan.reason}"`);
 
-    const result = (await client.callTool({
+    // Allocate once per purchase, outside any transport retry. Keep this id to resume after a process restart.
+    const intentId = args.intentId ?? randomUUID();
+    say(`purchase intent ${intentId}; if interrupted, resume with --scenario ${scenario.n} --intent-id ${intentId} (never a fresh id)`);
+    const purchaseCall = {
       name: 'request_purchase',
-      arguments: { merchant: plan.merchant, item: plan.item, category: plan.category, amount: plan.amount, currency: plan.currency, reason: plan.reason, source_url: plan.sourceUrl },
-    })) as ToolResult;
+      arguments: { intent_id: intentId, merchant: plan.merchant, item: plan.item, category: plan.category, amount: plan.amount, currency: plan.currency, reason: plan.reason, source_url: plan.sourceUrl },
+    };
+    const result = await requestPurchaseWithRetry(
+      async () => (await client.callTool(purchaseCall)) as ToolResult,
+      () => say(`guard reply was lost; retrying the same purchase intent ${intentId} once`),
+    );
     if (result.isError) {
       guardSays(`error: ${result.content?.[0]?.text ?? 'unknown'}`);
       failures++;

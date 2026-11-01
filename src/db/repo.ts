@@ -161,6 +161,10 @@ export class Repo {
   savePolicy(input: Omit<Policy, 'updatedAt'>): Policy {
     const problems = validatePolicy(input);
     if (problems.length > 0) throw new Error(`invalid policy: ${problems.join('; ')}`);
+    const previous = this.getPolicy(input.agentId);
+    if (previous && previous.currency !== input.currency && this.hasFinancialHistory(input.agentId)) {
+      throw new Error('cannot change currency with financial history; reconcile the legacy ledger explicitly instead of relabelling it');
+    }
     const policy: Policy = {
       ...input,
       merchantAllowlist: input.merchantAllowlist === null ? null : normalizeNames(input.merchantAllowlist),
@@ -461,6 +465,8 @@ export class Repo {
     return this.transaction(() => {
       const request = this.getRequest(requestId);
       if (!request) throw new Error(`unknown request "${requestId}"`);
+      const currencyIssue = this.currencyIssue(request.agentId);
+      if (request.currency !== 'USD' || currencyIssue) throw new Error(currencyIssue ?? 'Only USD purchases can be charged');
       const existing = this.paymentForRequest(requestId);
       if (existing) return existing;
       if (request.status !== 'AUTO_APPROVED' && request.status !== 'APPROVED') {
@@ -515,7 +521,14 @@ export class Repo {
       const payment = this.requirePayment(paymentId);
       if (payment.status === 'REFUND_PENDING' && payment.paypalRefundId === paypalRefundId) return payment;
       if (payment.status !== 'COMPLETED') throw new Error(`payment "${paymentId}" is ${payment.status}; only COMPLETED payments can have a pending refund`);
-      return this.updatePayment(paymentId, { paypalRefundId, status: 'REFUND_PENDING' });
+      const updated = this.updatePayment(paymentId, { paypalRefundId, status: 'REFUND_PENDING' });
+      // This audit entry is also the durable refund-attempt counter. Commit it WITH the pending state:
+      // otherwise a crash could consume a PayPal key without advancing the next attempt after cancellation.
+      this.appendAudit({
+        actor: 'system', action: 'refund.pending', requestId: payment.requestId, agentId: payment.agentId,
+        details: { paymentId: payment.id, paypalCaptureId: payment.paypalCaptureId, paypalRefundId },
+      });
+      return updated;
     });
   }
 
@@ -536,6 +549,23 @@ export class Repo {
 
   // ----------------------------------------------------- budget and history
 
+  private hasFinancialHistory(agentId: string): boolean {
+    return this.db.prepare(`SELECT 1 FROM payments WHERE agent_id = ?
+      UNION ALL SELECT 1 FROM requests WHERE agent_id = ? AND status IN ('AUTO_APPROVED', 'APPROVED', 'PAID', 'REFUNDED') LIMIT 1`).get(agentId, agentId) !== undefined;
+  }
+
+  /** Quarantine legacy currencies without converting, deleting, or relabelling their financial history. */
+  currencyIssue(agentId: string): string | undefined {
+    const policy = this.getPolicy(agentId);
+    const legacy = this.db.prepare(`SELECT 1 FROM payments WHERE agent_id = ? AND currency <> 'USD'
+      UNION ALL SELECT 1 FROM requests WHERE agent_id = ? AND currency <> 'USD'
+      AND status IN ('AUTO_APPROVED', 'APPROVED', 'PAID', 'REFUNDED') LIMIT 1`).get(agentId, agentId);
+    if ((policy && policy.currency !== 'USD') || legacy) {
+      return 'Spending and budget totals are unavailable: legacy non-USD financial data requires explicit reconciliation. No currency conversion has been performed.';
+    }
+    return undefined;
+  }
+
   /**
    * Spend that counts against the agent's budget for the month containing nowMs in the given zone:
    * completed captures in that month plus approved requests not yet captured. Refunded captures do not count; a
@@ -546,14 +576,16 @@ export class Repo {
    * the newer one sees the older one's amount, so they cannot both pass a budget that fits only one (D16).
    */
   spentThisMonthMinor(agentId: string, nowMs: number, timezone: string, deciding?: string): number {
+    const issue = this.currencyIssue(agentId);
+    if (issue) throw new Error(issue);
     const { startMs, endMs } = monthBounds(nowMs, timezone);
     const captured = this.db
-      .prepare(`SELECT COALESCE(SUM(amount_minor), 0) AS total FROM payments WHERE agent_id = ? AND status IN ${SPENT_SQL} AND captured_at >= ? AND captured_at < ?`)
+      .prepare(`SELECT COALESCE(SUM(amount_minor), 0) AS total FROM payments WHERE agent_id = ? AND currency = 'USD' AND status IN ${SPENT_SQL} AND captured_at >= ? AND captured_at < ?`)
       .get(agentId, startMs, endMs);
     const inFlight = this.db
       .prepare(
         `SELECT COALESCE(SUM(amount_minor), 0) AS total FROM requests
-         WHERE agent_id = ? AND (status IN ${IN_FLIGHT_SQL}
+         WHERE agent_id = ? AND currency = 'USD' AND (status IN ${IN_FLIGHT_SQL}
            OR (status = 'EVALUATING' AND rowid < COALESCE((SELECT rowid FROM requests WHERE id = ?), 0)))`,
       )
       .get(agentId, deciding ?? '');
@@ -596,6 +628,8 @@ export class Repo {
    */
   policyContext(agentId: string, nowMs: number = this.now(), deciding?: string): PolicyContext {
     const timezone = this.getPolicy(agentId)?.timezone ?? 'UTC';
+    const currencyIssue = this.currencyIssue(agentId);
+    if (currencyIssue) return { nowMs, spentThisMonthMinor: 0, knownMerchants: [], currencyIssue };
     return { nowMs, spentThisMonthMinor: this.spentThisMonthMinor(agentId, nowMs, timezone, deciding), knownMerchants: this.knownMerchants(agentId) };
   }
 

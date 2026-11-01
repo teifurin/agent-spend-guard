@@ -15,7 +15,7 @@ describe('reason codes', () => {
     const hold = REASON_CODES.filter((c) => severityOf(c) === 'HOLD');
     const block = REASON_CODES.filter((c) => severityOf(c) === 'BLOCK');
     expect(hold.sort()).toEqual(['CATEGORY_NOT_ALLOWED', 'MERCHANT_NOT_ALLOWED', 'NEW_MERCHANT', 'OUTSIDE_TIME_WINDOW', 'OVER_MONTHLY_BUDGET', 'OVER_TX_CAP']);
-    expect(block.sort()).toEqual(['AGENT_DISABLED', 'CURRENCY_MISMATCH', 'INVALID_AMOUNT', 'NO_POLICY', 'OVER_HARD_TX_CAP']);
+    expect(block.sort()).toEqual(['AGENT_DISABLED', 'CURRENCY_MISMATCH', 'INVALID_AMOUNT', 'NO_POLICY', 'OVER_HARD_TX_CAP', 'UNSUPPORTED_CURRENCY']);
   });
 });
 
