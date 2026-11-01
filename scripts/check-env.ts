@@ -20,9 +20,7 @@ const OPTIONAL = [
   'HOST',
   'PORT',
   'SHOP_PORT',
-  'SHOP_URL',
-  'GUARD_URL',
-  'AGENT_ID',
+  'SHOP_URL', // GUARD_URL and AGENT_ID are not read from .env by anything: the demo agent and the MCP server take them from their own environment
 ] as const;
 
 let ready = true;

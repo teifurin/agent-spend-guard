@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # The README promises Node 22.13 or newer; 22 and 24 are the two lines a judge is likely to have.
+        # The README names Node 22 (22.13 or later) and Node 24 as the two lines CI covers; a judge is likely to have one of them.
         node: [22, 24]
     steps:
       - uses: actions/checkout@v4
